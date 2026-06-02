@@ -16,6 +16,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True, help="Directory for CSV, log, summary, and checkpoint files.")
     parser.add_argument("--max-pages", type=int, default=2000, help="Maximum number of pages to crawl. Default: 2000.")
     parser.add_argument(
+        "--no-max-pages",
+        action="store_true",
+        help="Crawl until the internal URL queue is exhausted.",
+    )
+    parser.add_argument(
         "--rate-limit",
         type=float,
         default=1.0,
@@ -56,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.max_pages <= 0:
+    if not args.no_max_pages and args.max_pages <= 0:
         raise ValueError("--max-pages must be greater than 0")
     if args.rate_limit < 0:
         raise ValueError("--rate-limit must be 0 or greater")
@@ -87,7 +92,7 @@ async def main_async(argv: list[str] | None = None) -> int:
     config = CrawlConfig(
         start_url=args.start_url,
         output_dir=output_dir,
-        max_pages=args.max_pages,
+        max_pages=None if args.no_max_pages else args.max_pages,
         rate_limit=args.rate_limit,
         wait_buffer_seconds=args.wait_buffer,
         boilerplate_threshold=args.boilerplate_threshold,

@@ -45,13 +45,19 @@ PAGE_TIMEOUT_MS = 30_000
 class CrawlConfig:
     start_url: str
     output_dir: Path
-    max_pages: int = 2000
+    max_pages: Optional[int] = 2000
     rate_limit: float = 1.0
     wait_buffer_seconds: float = 2.0
     boilerplate_threshold: float = 0.80
     include_subdomains: bool = False
     ignore_robots: bool = False
     contact_email: Optional[str] = None
+
+
+@dataclass
+class EnqueueStats:
+    queued: int = 0
+    skipped_assets: int = 0
 
 
 class InternalLinkCrawler:
@@ -86,9 +92,15 @@ class InternalLinkCrawler:
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.launch(headless=True)
                 context = await browser.new_context(user_agent=self.user_agent)
-                progress = tqdm(total=self.config.max_pages, initial=len(self.pages), desc="Pages crawled", unit="page")
+                progress = tqdm(
+                    total=self._progress_total(),
+                    initial=self._progress_initial(),
+                    desc="URLs processed",
+                    unit="url",
+                    dynamic_ncols=True,
+                )
                 try:
-                    while self.queue and len(self.pages) < self.config.max_pages:
+                    while self.queue and self._can_crawl_more():
                         url, depth = self.queue.popleft()
                         if url in self.visited:
                             continue
@@ -96,24 +108,36 @@ class InternalLinkCrawler:
                             self.pages_skipped_robots += 1
                             self.visited.add(url)
                             self.logger.info(f"Skipped by robots.txt: {url}")
-                            progress.set_postfix(queue=len(self.queue))
+                            tqdm.write(f"Skipped by robots.txt depth={depth}: {url}")
+                            progress.update(1)
+                            progress.set_postfix(queue=len(self.queue), pages=len(self.pages))
                             continue
 
+                        tqdm.write(f"Fetching depth={depth} queue={len(self.queue)}: {url}")
                         await self._respect_rate_limit(url)
                         page_result, page_links = await self._crawl_one(context, url, depth)
                         self.visited.add(url)
                         self.pages.append(page_result)
                         self.links.extend(page_links)
-                        self._enqueue_internal_links(page_links, depth)
+                        enqueue_stats = self._enqueue_internal_links(page_links, depth)
+
+                        if self.config.max_pages is None and enqueue_stats.queued:
+                            progress.total = (progress.total or 0) + enqueue_stats.queued
+                            progress.refresh()
 
                         progress.update(1)
-                        progress.set_postfix(queue=len(self.queue))
+                        progress.set_postfix(queue=len(self.queue), pages=len(self.pages))
+                        self._write_live_fetch_result(page_result, page_links, enqueue_stats, depth)
 
                         if len(self.pages) % CHECKPOINT_INTERVAL == 0:
                             self.save_checkpoint()
-                            print(f"\nCheckpoint saved after {len(self.pages)} pages.")
+                            tqdm.write(f"Checkpoint saved after {len(self.pages)} pages.")
 
-                    self.max_pages_reached = len(self.pages) >= self.config.max_pages and bool(self.queue)
+                    self.max_pages_reached = (
+                        self.config.max_pages is not None
+                        and len(self.pages) >= self.config.max_pages
+                        and bool(self.queue)
+                    )
                 finally:
                     progress.close()
                     await context.close()
@@ -303,7 +327,19 @@ class InternalLinkCrawler:
             await asyncio.sleep(delay - elapsed)
         self._last_request_at[host] = time.monotonic()
 
-    def _enqueue_internal_links(self, links: list[ExtractedLink], depth: int) -> None:
+    def _can_crawl_more(self) -> bool:
+        return self.config.max_pages is None or len(self.pages) < self.config.max_pages
+
+    def _progress_initial(self) -> int:
+        return len(self.pages) + self.pages_skipped_robots
+
+    def _progress_total(self) -> int:
+        if self.config.max_pages is not None:
+            return self.config.max_pages
+        return max(len(self.queued), self._progress_initial() + len(self.queue), 1)
+
+    def _enqueue_internal_links(self, links: list[ExtractedLink], depth: int) -> EnqueueStats:
+        stats = EnqueueStats()
         for link in links:
             if not link.is_internal:
                 continue
@@ -312,9 +348,32 @@ class InternalLinkCrawler:
             if not is_internal_url(link.target_url, self.policy):
                 continue
             if is_non_html_asset_url(link.target_url):
+                stats.skipped_assets += 1
                 continue
             self.queue.append((link.target_url, depth + 1))
             self.queued.add(link.target_url)
+            stats.queued += 1
+        return stats
+
+    def _write_live_fetch_result(
+        self,
+        page_result: dict[str, Any],
+        page_links: list[ExtractedLink],
+        enqueue_stats: EnqueueStats,
+        depth: int,
+    ) -> None:
+        internal_links = sum(1 for link in page_links if link.is_internal)
+        external_links = len(page_links) - internal_links
+        message = (
+            f"Fetched status={page_result['status_code']} depth={depth} "
+            f"duration={page_result['crawl_duration_ms']}ms "
+            f"links={len(page_links)} internal={internal_links} external={external_links} "
+            f"queued=+{enqueue_stats.queued} assets_skipped={enqueue_stats.skipped_assets}: "
+            f"{page_result['final_url']}"
+        )
+        if page_result.get("error"):
+            message = f"{message} | error={page_result['error']}"
+        tqdm.write(message)
 
     def _load_state(self, state: dict[str, Any]) -> None:
         self.queue = deque((item[0], int(item[1])) for item in state.get("queue", []))

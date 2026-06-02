@@ -40,6 +40,7 @@ Required flags:
 Optional flags:
 
 - `--max-pages`: maximum pages to crawl. Default: `2000`.
+- `--no-max-pages`: crawl until the internal URL queue is exhausted.
 - `--rate-limit`: per-domain requests per second. Default: `1.0`.
 - `--wait-buffer`: extra seconds after network idle for late-rendered content. Default: `2.0`.
 - `--boilerplate-threshold`: fraction of crawled pages above which repeated internal links are boilerplate. Default: `0.80`.
@@ -77,9 +78,11 @@ is_boilerplate, rel_attribute
 ## Behavior Notes
 
 - JavaScript-rendered HTML is captured through Playwright Chromium.
+- Terminal output includes a live URL progress bar plus fetch/queue/status updates.
 - The crawler waits for `networkidle`, applies `--wait-buffer`, and caps page wait time at 30 seconds.
 - `robots.txt` is honored by default using the crawler User-Agent.
-- Non-HTML resources are recorded as page errors and are not parsed.
+- Obvious non-page assets such as images, PDFs, scripts, stylesheets, and fonts are recorded as links but are not enqueued for page crawling.
+- Other non-HTML resources that are crawled are recorded as page errors and are not parsed.
 - HTTP `4xx` and `5xx` pages are recorded and not parsed for links.
 - Boilerplate detection is skipped when fewer than 20 pages are crawled; `is_boilerplate` is blank in that case.
 - URL fragments and unsupported schemes such as `mailto:`, `tel:`, and `javascript:` are skipped.
