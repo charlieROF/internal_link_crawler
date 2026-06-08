@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from playwright.async_api import async_playwright
 from tqdm import tqdm
 
 from boilerplate import apply_boilerplate_detection
+from content_extractor import extract as extract_content
 from link_extractor import ExtractedLink, extract_links, extract_page_metadata
 from output import (
     CrawlLogger,
@@ -23,6 +25,7 @@ from output import (
     load_checkpoint,
     write_checkpoint,
     write_links_csv,
+    write_page_content_csv,
     write_pages_csv,
     write_summary,
 )
@@ -52,6 +55,7 @@ class CrawlConfig:
     include_subdomains: bool = False
     ignore_robots: bool = False
     contact_email: Optional[str] = None
+    body_text_enabled: bool = True
 
 
 @dataclass
@@ -76,6 +80,7 @@ class InternalLinkCrawler:
         self.visited: set[str] = set()
         self.pages: list[dict[str, Any]] = []
         self.links: list[ExtractedLink] = []
+        self.page_content_records: list[dict[str, Any]] = []
         self.pages_skipped_robots = 0
         self.crawl_started = datetime.now(timezone.utc)
         self.max_pages_reached = False
@@ -160,6 +165,7 @@ class InternalLinkCrawler:
                 "visited": sorted(self.visited),
                 "pages": self.pages,
                 "links": self.links,
+                "page_content_records": self.page_content_records if self.config.body_text_enabled else [],
                 "pages_skipped_robots": self.pages_skipped_robots,
                 "crawl_started": self.crawl_started.isoformat(),
                 "max_pages_reached": self.max_pages_reached,
@@ -200,6 +206,8 @@ class InternalLinkCrawler:
                 html = await page.content()
                 metadata = extract_page_metadata(html)
                 page_links = extract_links(html, final_url, self.policy, self.logger)
+                if self.config.body_text_enabled:
+                    self._extract_body_content(html, url)
                 internal_count = sum(1 for link in page_links if link.is_internal)
                 external_count = len(page_links) - internal_count
                 row = self._page_row(
@@ -268,6 +276,8 @@ class InternalLinkCrawler:
 
         write_pages_csv(self.config.output_dir, self.pages)
         write_links_csv(self.config.output_dir, self.links)
+        if self.config.body_text_enabled and self.page_content_records:
+            write_page_content_csv(self.page_content_records, self.config.output_dir)
 
         completed = datetime.now(timezone.utc)
         summary = {
@@ -291,6 +301,7 @@ class InternalLinkCrawler:
                 "ignore_robots": self.config.ignore_robots,
                 "boilerplate_threshold": self.config.boilerplate_threshold,
             },
+            "body_extraction": self._body_extraction_summary(),
         }
         write_summary(self.config.output_dir, summary)
         self._print_summary(summary)
@@ -375,12 +386,84 @@ class InternalLinkCrawler:
             message = f"{message} | error={page_result['error']}"
         tqdm.write(message)
 
+    def _extract_body_content(self, html: str, url: str) -> None:
+        extracted_at = datetime.now(timezone.utc).isoformat()
+        try:
+            result = extract_content(html, url)
+            record = {
+                "url": url,
+                "main_heading_text": result["main_heading_text"],
+                "body_text": result["body_text"],
+                "extraction_quality": result["extraction_quality"],
+                "truncated": result["truncated"],
+                "original_length": result["original_length"],
+                "char_count": result["char_count"],
+                "extracted_at": extracted_at,
+            }
+            self.page_content_records.append(record)
+            self.logger.info(
+                "Body extracted from "
+                f"{url}: quality={record['extraction_quality']}, "
+                f"chars={record['char_count']}, truncated={record['truncated']}"
+            )
+            if record["extraction_quality"] == "fallback":
+                self.logger.warning(
+                    f"Body extraction fallback for {url}: no main/article/selector match, used largest text block"
+                )
+        except Exception as exc:
+            self.logger.error(f"Body extraction failed for {url}: {exc}")
+            self.page_content_records.append(
+                {
+                    "url": url,
+                    "main_heading_text": "",
+                    "body_text": "",
+                    "extraction_quality": "error",
+                    "truncated": False,
+                    "original_length": 0,
+                    "char_count": 0,
+                    "extracted_at": extracted_at,
+                }
+            )
+
+    def _body_extraction_summary(self) -> dict[str, Any]:
+        if not self.config.body_text_enabled:
+            return {
+                "enabled": False,
+                "pages_with_extraction": 0,
+                "extraction_quality_breakdown": {
+                    "main": 0,
+                    "article": 0,
+                    "selector": 0,
+                    "fallback": 0,
+                    "uncertain": 0,
+                    "error": 0,
+                },
+                "truncated_count": 0,
+                "average_char_count": 0,
+                "median_char_count": 0,
+            }
+
+        qualities = ["main", "article", "selector", "fallback", "uncertain", "error"]
+        char_counts = [int(record.get("char_count", 0)) for record in self.page_content_records]
+        return {
+            "enabled": True,
+            "pages_with_extraction": len(self.page_content_records),
+            "extraction_quality_breakdown": {
+                quality: sum(1 for record in self.page_content_records if record.get("extraction_quality") == quality)
+                for quality in qualities
+            },
+            "truncated_count": sum(1 for record in self.page_content_records if record.get("truncated")),
+            "average_char_count": round(sum(char_counts) / len(char_counts)) if char_counts else 0,
+            "median_char_count": round(statistics.median(char_counts)) if char_counts else 0,
+        }
+
     def _load_state(self, state: dict[str, Any]) -> None:
         self.queue = deque((item[0], int(item[1])) for item in state.get("queue", []))
         self.queued = set(state.get("queued", [])) or {url for url, _depth in self.queue}
         self.visited = set(state.get("visited", []))
         self.pages = list(state.get("pages", []))
         self.links = [ExtractedLink(**item) for item in state.get("links", [])]
+        self.page_content_records = list(state.get("page_content_records", []))
         self.pages_skipped_robots = int(state.get("pages_skipped_robots", 0))
         if state.get("crawl_started"):
             self.crawl_started = datetime.fromisoformat(state["crawl_started"])

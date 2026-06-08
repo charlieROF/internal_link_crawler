@@ -34,6 +34,17 @@ LINKS_COLUMNS = [
     "rel_attribute",
 ]
 
+PAGE_CONTENT_COLUMNS = [
+    "url",
+    "main_heading_text",
+    "body_text",
+    "extraction_quality",
+    "truncated",
+    "original_length",
+    "char_count",
+    "extracted_at",
+]
+
 
 class CrawlLogger:
     def __init__(self, output_dir: Path):
@@ -75,6 +86,14 @@ def write_links_csv(output_dir: Path, links: list[Any]) -> None:
         for link in links:
             row = asdict(link) if is_dataclass(link) else dict(link)
             writer.writerow({column: _csv_value(row.get(column)) for column in LINKS_COLUMNS})
+
+
+def write_page_content_csv(records: list[dict[str, Any]], output_dir: Path) -> None:
+    with (output_dir / "page_content.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PAGE_CONTENT_COLUMNS)
+        writer.writeheader()
+        for record in records:
+            writer.writerow({column: _csv_value(record.get(column)) for column in PAGE_CONTENT_COLUMNS})
 
 
 def write_summary(output_dir: Path, summary: dict[str, Any]) -> None:

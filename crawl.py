@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume automatically from .checkpoint.json if it exists.",
     )
+    parser.add_argument(
+        "--no-body-text",
+        action="store_true",
+        help="Skip body content extraction. No page_content.csv is produced.",
+    )
     return parser
 
 
@@ -99,6 +104,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         include_subdomains=args.include_subdomains,
         ignore_robots=args.ignore_robots,
         contact_email=args.contact_email,
+        body_text_enabled=not args.no_body_text,
     )
     crawler = InternalLinkCrawler(config)
     try:
