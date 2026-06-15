@@ -33,6 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional seconds to wait after network idle. Default: 2.0.",
     )
     parser.add_argument(
+        "--networkidle-timeout",
+        type=float,
+        default=5.0,
+        help="Maximum seconds to wait for network idle after DOM content loads. Default: 5.0.",
+    )
+    parser.add_argument(
         "--boilerplate-threshold",
         type=float,
         default=0.80,
@@ -62,6 +68,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip body content extraction. No page_content.csv is produced.",
     )
+    parser.add_argument(
+        "--ignore-crawl-query-params",
+        default="_pos,_sid,_ss,_fid,bvroute,bvstate",
+        help=(
+            "Comma-separated query parameters to strip before enqueueing URLs for crawling. "
+            "Default: _pos,_sid,_ss,_fid,bvroute,bvstate. Use an empty string to disable."
+        ),
+    )
+    parser.add_argument(
+        "--keep-shopify-collection-product-urls",
+        action="store_true",
+        help=(
+            "Do not canonicalize Shopify /collections/<collection>/products/<handle> URLs "
+            "to /products/<handle> for crawl deduplication."
+        ),
+    )
     return parser
 
 
@@ -72,6 +94,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rate-limit must be 0 or greater")
     if args.wait_buffer < 0:
         raise ValueError("--wait-buffer must be 0 or greater")
+    if args.networkidle_timeout < 0:
+        raise ValueError("--networkidle-timeout must be 0 or greater")
     if not 0 < args.boilerplate_threshold <= 1:
         raise ValueError("--boilerplate-threshold must be greater than 0 and less than or equal to 1")
 
@@ -100,11 +124,14 @@ async def main_async(argv: list[str] | None = None) -> int:
         max_pages=None if args.no_max_pages else args.max_pages,
         rate_limit=args.rate_limit,
         wait_buffer_seconds=args.wait_buffer,
+        networkidle_timeout_seconds=args.networkidle_timeout,
         boilerplate_threshold=args.boilerplate_threshold,
         include_subdomains=args.include_subdomains,
         ignore_robots=args.ignore_robots,
         contact_email=args.contact_email,
         body_text_enabled=not args.no_body_text,
+        ignored_crawl_query_params=_parse_csv_arg(args.ignore_crawl_query_params),
+        canonicalize_shopify_product_urls=not args.keep_shopify_collection_product_urls,
     )
     crawler = InternalLinkCrawler(config)
     try:
@@ -121,6 +148,10 @@ async def main_async(argv: list[str] | None = None) -> int:
 def _prompt_resume(checkpoint) -> bool:
     answer = input(f"Checkpoint found at {checkpoint}. Resume? [y/N]: ").strip().lower()
     return answer in {"y", "yes"}
+
+
+def _parse_csv_arg(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in (value or "").split(",") if item.strip())
 
 
 def main() -> int:

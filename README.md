@@ -28,6 +28,8 @@ python crawl.py \
   --max-pages 2000 \
   --rate-limit 1.0 \
   --wait-buffer 2.0 \
+  --networkidle-timeout 5.0 \
+  --ignore-crawl-query-params _pos,_sid,_ss,_fid,bvroute,bvstate \
   --boilerplate-threshold 0.80 \
   --contact-email you@example.com
 ```
@@ -43,6 +45,9 @@ Optional flags:
 - `--no-max-pages`: crawl until the internal URL queue is exhausted.
 - `--rate-limit`: per-domain requests per second. Default: `1.0`.
 - `--wait-buffer`: extra seconds after network idle for late-rendered content. Default: `2.0`.
+- `--networkidle-timeout`: maximum seconds to wait for network idle after DOM content loads. Default: `5.0`.
+- `--ignore-crawl-query-params`: comma-separated query parameters to strip before enqueueing URLs for crawling. Default: `_pos,_sid,_ss,_fid,bvroute,bvstate`.
+- `--keep-shopify-collection-product-urls`: do not canonicalize Shopify `/collections/<collection>/products/<handle>` URLs to `/products/<handle>` for crawl deduplication.
 - `--boilerplate-threshold`: fraction of crawled pages above which repeated internal links are boilerplate. Default: `0.80`.
 - `--include-subdomains`: treat subdomains as internal.
 - `--ignore-robots`: ignore `robots.txt` and log a warning.
@@ -102,7 +107,9 @@ Extraction quality values:
 - Body extraction is enabled by default and can be disabled with `--no-body-text`.
 - Body extraction removes common non-content containers before selecting content, including `script`, `style`, `noscript`, `template`, `nav`, `header`, `footer`, `aside`, `form`, cookie/consent widgets, chat widgets, and hidden elements.
 - Terminal output includes a live URL progress bar plus fetch/queue/status updates.
-- The crawler waits for `networkidle`, applies `--wait-buffer`, and caps page wait time at 30 seconds.
+- The crawler waits for `networkidle` up to `--networkidle-timeout`, applies `--wait-buffer`, and keeps a hard page cap of 30 seconds.
+- Crawl discovery strips known non-content query parameters before enqueueing URLs. This prevents Shopify search/recommendation params such as `_pos`, `_sid`, `_ss`, `_fid` and Bazaarvoice review params such as `bvroute`, `bvstate` from creating thousands of duplicate product-page fetches. Link instances are still recorded in `links.csv`.
+- Shopify collection-context product URLs are canonicalized for crawling, so `/collections/all/products/example` and `/products/example` are fetched as the same page by default. Use `--keep-shopify-collection-product-urls` to disable this.
 - `robots.txt` is honored by default using the crawler User-Agent.
 - Obvious non-page assets such as images, PDFs, scripts, stylesheets, and fonts are recorded as links but are not enqueued for page crawling.
 - Other non-HTML resources that are crawled are recorded as page errors and are not parsed.

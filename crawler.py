@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import statistics
 import time
 from collections import deque
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib import robotparser
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -51,17 +52,21 @@ class CrawlConfig:
     max_pages: Optional[int] = 2000
     rate_limit: float = 1.0
     wait_buffer_seconds: float = 2.0
+    networkidle_timeout_seconds: float = 5.0
     boilerplate_threshold: float = 0.80
     include_subdomains: bool = False
     ignore_robots: bool = False
     contact_email: Optional[str] = None
     body_text_enabled: bool = True
+    ignored_crawl_query_params: tuple[str, ...] = ("_pos", "_sid", "_ss", "_fid", "bvroute", "bvstate")
+    canonicalize_shopify_product_urls: bool = True
 
 
 @dataclass
 class EnqueueStats:
     queued: int = 0
     skipped_assets: int = 0
+    skipped_query_duplicates: int = 0
 
 
 class InternalLinkCrawler:
@@ -77,7 +82,9 @@ class InternalLinkCrawler:
         self.robot_parser: Optional[robotparser.RobotFileParser] = None
         self.queue: deque[tuple[str, int]] = deque([(self.start_url, 0)])
         self.queued: set[str] = {self.start_url}
+        self.queued_crawl_keys: set[str] = {self._crawl_key(self.start_url)}
         self.visited: set[str] = set()
+        self.visited_crawl_keys: set[str] = set()
         self.pages: list[dict[str, Any]] = []
         self.links: list[ExtractedLink] = []
         self.page_content_records: list[dict[str, Any]] = []
@@ -107,11 +114,14 @@ class InternalLinkCrawler:
                 try:
                     while self.queue and self._can_crawl_more():
                         url, depth = self.queue.popleft()
-                        if url in self.visited:
+                        url = self._canonical_crawl_url(url)
+                        crawl_key = self._crawl_key(url)
+                        if crawl_key in self.visited_crawl_keys:
                             continue
                         if not self._robots_allowed(url):
                             self.pages_skipped_robots += 1
                             self.visited.add(url)
+                            self.visited_crawl_keys.add(crawl_key)
                             self.logger.info(f"Skipped by robots.txt: {url}")
                             tqdm.write(f"Skipped by robots.txt depth={depth}: {url}")
                             progress.update(1)
@@ -122,6 +132,7 @@ class InternalLinkCrawler:
                         await self._respect_rate_limit(url)
                         page_result, page_links = await self._crawl_one(context, url, depth)
                         self.visited.add(url)
+                        self.visited_crawl_keys.add(crawl_key)
                         self.pages.append(page_result)
                         self.links.extend(page_links)
                         enqueue_stats = self._enqueue_internal_links(page_links, depth)
@@ -245,11 +256,16 @@ class InternalLinkCrawler:
 
     async def _wait_for_render(self, page, url: str, started: float) -> None:
         remaining_ms = max(0, PAGE_TIMEOUT_MS - int((time.monotonic() - started) * 1000))
-        if remaining_ms > 0:
+        networkidle_timeout_ms = int(self.config.networkidle_timeout_seconds * 1000)
+        networkidle_wait_ms = min(networkidle_timeout_ms, remaining_ms)
+        if networkidle_wait_ms > 0:
             try:
-                await page.wait_for_load_state("networkidle", timeout=remaining_ms)
+                await page.wait_for_load_state("networkidle", timeout=networkidle_wait_ms)
             except PlaywrightTimeoutError:
-                self.logger.warning(f"Network idle timeout on {url}; using currently rendered HTML.")
+                self.logger.warning(
+                    f"Network idle timeout after {self.config.networkidle_timeout_seconds}s on "
+                    f"{url}; using currently rendered HTML."
+                )
 
         remaining_ms = max(0, PAGE_TIMEOUT_MS - int((time.monotonic() - started) * 1000))
         requested_buffer_ms = int(self.config.wait_buffer_seconds * 1000)
@@ -297,6 +313,9 @@ class InternalLinkCrawler:
                 "max_pages": self.config.max_pages,
                 "rate_limit": self.config.rate_limit,
                 "wait_buffer_seconds": self.config.wait_buffer_seconds,
+                "networkidle_timeout_seconds": self.config.networkidle_timeout_seconds,
+                "ignored_crawl_query_params": list(self.config.ignored_crawl_query_params),
+                "canonicalize_shopify_product_urls": self.config.canonicalize_shopify_product_urls,
                 "include_subdomains": self.config.include_subdomains,
                 "ignore_robots": self.config.ignore_robots,
                 "boilerplate_threshold": self.config.boilerplate_threshold,
@@ -354,15 +373,20 @@ class InternalLinkCrawler:
         for link in links:
             if not link.is_internal:
                 continue
-            if link.target_url in self.visited or link.target_url in self.queued:
+            crawl_url = self._canonical_crawl_url(link.target_url)
+            crawl_key = self._crawl_key(crawl_url)
+            if crawl_key in self.visited_crawl_keys or crawl_key in self.queued_crawl_keys:
+                if crawl_url != link.target_url:
+                    stats.skipped_query_duplicates += 1
                 continue
-            if not is_internal_url(link.target_url, self.policy):
+            if not is_internal_url(crawl_url, self.policy):
                 continue
-            if is_non_html_asset_url(link.target_url):
+            if is_non_html_asset_url(crawl_url):
                 stats.skipped_assets += 1
                 continue
-            self.queue.append((link.target_url, depth + 1))
-            self.queued.add(link.target_url)
+            self.queue.append((crawl_url, depth + 1))
+            self.queued.add(crawl_url)
+            self.queued_crawl_keys.add(crawl_key)
             stats.queued += 1
         return stats
 
@@ -379,7 +403,8 @@ class InternalLinkCrawler:
             f"Fetched status={page_result['status_code']} depth={depth} "
             f"duration={page_result['crawl_duration_ms']}ms "
             f"links={len(page_links)} internal={internal_links} external={external_links} "
-            f"queued=+{enqueue_stats.queued} assets_skipped={enqueue_stats.skipped_assets}: "
+            f"queued=+{enqueue_stats.queued} assets_skipped={enqueue_stats.skipped_assets} "
+            f"query_dupes_skipped={enqueue_stats.skipped_query_duplicates}: "
             f"{page_result['final_url']}"
         )
         if page_result.get("error"):
@@ -458,16 +483,57 @@ class InternalLinkCrawler:
         }
 
     def _load_state(self, state: dict[str, Any]) -> None:
-        self.queue = deque((item[0], int(item[1])) for item in state.get("queue", []))
-        self.queued = set(state.get("queued", [])) or {url for url, _depth in self.queue}
         self.visited = set(state.get("visited", []))
         self.pages = list(state.get("pages", []))
+        self.visited_crawl_keys = {
+            self._crawl_key(url)
+            for url in list(self.visited) + [page.get("url", "") for page in self.pages]
+            if url
+        }
+        self.queue = deque()
+        self.queued = set()
+        self.queued_crawl_keys = set()
+        removed_duplicate_queue_urls = 0
+        for item in state.get("queue", []):
+            url, depth = item[0], int(item[1])
+            crawl_url = self._canonical_crawl_url(url)
+            crawl_key = self._crawl_key(crawl_url)
+            if crawl_key in self.visited_crawl_keys or crawl_key in self.queued_crawl_keys:
+                removed_duplicate_queue_urls += 1
+                continue
+            self.queue.append((crawl_url, depth))
+            self.queued.add(crawl_url)
+            self.queued_crawl_keys.add(crawl_key)
+        if removed_duplicate_queue_urls:
+            self.logger.info(
+                f"Compacted resume queue by removing {removed_duplicate_queue_urls} query-duplicate URLs."
+            )
         self.links = [ExtractedLink(**item) for item in state.get("links", [])]
         self.page_content_records = list(state.get("page_content_records", []))
         self.pages_skipped_robots = int(state.get("pages_skipped_robots", 0))
         if state.get("crawl_started"):
             self.crawl_started = datetime.fromisoformat(state["crawl_started"])
         self.max_pages_reached = bool(state.get("max_pages_reached", False))
+
+    def _canonical_crawl_url(self, url: str) -> str:
+        path = urlsplit(url).path
+        if self.config.canonicalize_shopify_product_urls:
+            path = re.sub(r"^/collections/[^/]+/products/([^/]+)/?$", r"/products/\1/", path)
+        if not self.config.ignored_crawl_query_params:
+            parts = urlsplit(url)
+            return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
+        ignored = set(self.config.ignored_crawl_query_params)
+        parts = urlsplit(url)
+        params = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key not in ignored
+        ]
+        query = urlencode(params, doseq=True)
+        return urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+
+    def _crawl_key(self, url: str) -> str:
+        return self._canonical_crawl_url(url)
 
     def _user_agent(self) -> str:
         contact = self.config.contact_email or DEFAULT_CONTACT_EMAIL
