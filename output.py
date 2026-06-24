@@ -16,6 +16,11 @@ PAGES_COLUMNS = [
     "title",
     "h1",
     "meta_description",
+    "canonical_url",
+    "meta_robots",
+    "x_robots_tag",
+    "indexable",
+    "word_count",
     "internal_outlinks_count",
     "external_outlinks_count",
     "internal_inlinks_count",
@@ -33,6 +38,18 @@ LINKS_COLUMNS = [
     "is_boilerplate",
     "rel_attribute",
 ]
+
+RECONCILIATION_COLUMNS = [
+    "url",
+    "in_crawl",
+    "in_sitemap",
+    "in_semrush",
+    "in_gsc",
+    "classification",
+]
+
+# Header names commonly used for the URL column in SEMRush / GSC exports.
+_URL_COLUMN_HINTS = ("url", "page url", "page", "landing page", "address", "top pages")
 
 PAGE_CONTENT_COLUMNS = [
     "url",
@@ -94,6 +111,52 @@ def write_page_content_csv(records: list[dict[str, Any]], output_dir: Path) -> N
         writer.writeheader()
         for record in records:
             writer.writerow({column: _csv_value(record.get(column)) for column in PAGE_CONTENT_COLUMNS})
+
+
+def write_reconciliation_csv(output_dir: Path, rows: list[dict[str, Any]]) -> None:
+    with (output_dir / "coverage_reconciliation.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RECONCILIATION_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: _csv_value(row.get(column)) for column in RECONCILIATION_COLUMNS})
+
+
+def read_url_list_csv(path: str) -> list[str]:
+    """Extract URLs from an arbitrary CSV export (SEMRush, GSC, etc.).
+
+    Prefers a recognizable URL column; otherwise falls back to any cell that
+    looks like an http(s) URL. Tolerant of leading preamble rows.
+    """
+    urls: list[str] = []
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
+        rows = list(csv.reader(handle))
+    if not rows:
+        return urls
+
+    url_col = None
+    header_idx = None
+    for idx, row in enumerate(rows[:15]):
+        lowered = [cell.strip().lower() for cell in row]
+        for col, value in enumerate(lowered):
+            if value in _URL_COLUMN_HINTS:
+                url_col, header_idx = col, idx
+                break
+        if url_col is not None:
+            break
+
+    if url_col is not None:
+        for row in rows[header_idx + 1:]:
+            if url_col < len(row):
+                cell = row[url_col].strip()
+                if cell.lower().startswith(("http://", "https://")):
+                    urls.append(cell)
+    else:
+        for row in rows:
+            for cell in row:
+                cell = cell.strip()
+                if cell.lower().startswith(("http://", "https://")):
+                    urls.append(cell)
+    return urls
 
 
 def write_summary(output_dir: Path, summary: dict[str, Any]) -> None:

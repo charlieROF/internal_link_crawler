@@ -30,13 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-buffer",
         type=float,
         default=2.0,
-        help="Additional seconds to wait after network idle. Default: 2.0.",
+        help="Seconds to wait after domcontentloaded for late/lazy rendering. Default: 2.0.",
     )
     parser.add_argument(
         "--networkidle-timeout",
         type=float,
-        default=5.0,
-        help="Maximum seconds to wait for network idle after DOM content loads. Default: 5.0.",
+        default=0.0,
+        help=(
+            "Optional max seconds to additionally wait for network idle. Default: 0.0 (disabled). "
+            "Leave at 0 for Shopify and other stacks that never reach network idle; the "
+            "domcontentloaded + --wait-buffer gate is used instead."
+        ),
     )
     parser.add_argument(
         "--boilerplate-threshold",
@@ -82,6 +86,33 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Do not canonicalize Shopify /collections/<collection>/products/<handle> URLs "
             "to /products/<handle> for crawl deduplication."
+        ),
+    )
+    parser.add_argument(
+        "--no-sitemap",
+        action="store_true",
+        help=(
+            "Do not fetch XML sitemaps from robots.txt (or /sitemap.xml) to seed the crawl "
+            "frontier. Sitemap seeding finds orphan pages that no internal link points to."
+        ),
+    )
+    parser.add_argument(
+        "--semrush-csv",
+        help=(
+            "Optional CSV of SEMRush URLs (e.g. Site Audit 'Crawled Pages') to include in the "
+            "coverage reconciliation report."
+        ),
+    )
+    parser.add_argument(
+        "--gsc-csv",
+        help="Optional CSV of GSC indexed-page URLs to include in the coverage reconciliation report.",
+    )
+    parser.add_argument(
+        "--seed-urls",
+        action="append",
+        help=(
+            "Path to a CSV/text file of additional URLs to seed into the crawl frontier "
+            "(repeatable). Use to force-fetch coverage-gap URLs not found via links or sitemap."
         ),
     )
     return parser
@@ -132,6 +163,10 @@ async def main_async(argv: list[str] | None = None) -> int:
         body_text_enabled=not args.no_body_text,
         ignored_crawl_query_params=_parse_csv_arg(args.ignore_crawl_query_params),
         canonicalize_shopify_product_urls=not args.keep_shopify_collection_product_urls,
+        sitemap_enabled=not args.no_sitemap,
+        semrush_csv=args.semrush_csv,
+        gsc_csv=args.gsc_csv,
+        seed_urls_files=tuple(args.seed_urls or ()),
     )
     crawler = InternalLinkCrawler(config)
     try:
