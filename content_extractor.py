@@ -7,7 +7,9 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 
-MAX_BODY_CHARS = 3000
+# Safety ceiling only. Set well above the largest real page so normal
+# product/policy pages are never cut; truncation should effectively never fire.
+MAX_BODY_CHARS = 50_000
 MIN_MEANINGFUL_CHARS = 20
 CONTENT_SELECTORS = [
     "#content",
@@ -199,6 +201,7 @@ def _result(body_text: str, heading: str, quality: str, truncated: bool, origina
         "truncated": truncated,
         "original_length": original_length,
         "char_count": len(body_text),
+        "word_count": len(body_text.split()),
     }
 
 

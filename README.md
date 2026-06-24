@@ -28,7 +28,7 @@ python crawl.py \
   --max-pages 2000 \
   --rate-limit 1.0 \
   --wait-buffer 2.0 \
-  --networkidle-timeout 5.0 \
+  --networkidle-timeout 0.0 \
   --ignore-crawl-query-params _pos,_sid,_ss,_fid,bvroute,bvstate \
   --boilerplate-threshold 0.80 \
   --contact-email you@example.com
@@ -44,8 +44,8 @@ Optional flags:
 - `--max-pages`: maximum pages to crawl. Default: `2000`.
 - `--no-max-pages`: crawl until the internal URL queue is exhausted.
 - `--rate-limit`: per-domain requests per second. Default: `1.0`.
-- `--wait-buffer`: extra seconds after network idle for late-rendered content. Default: `2.0`.
-- `--networkidle-timeout`: maximum seconds to wait for network idle after DOM content loads. Default: `5.0`.
+- `--wait-buffer`: seconds to wait after `domcontentloaded` for late/lazy-rendered content. This is the primary render gate. Default: `2.0`.
+- `--networkidle-timeout`: optional additional seconds to wait for network idle. Default: `0.0` (disabled). Leave at `0` for Shopify and other stacks that hold connections open and never reach network idle; the `domcontentloaded` + `--wait-buffer` gate is used instead.
 - `--ignore-crawl-query-params`: comma-separated query parameters to strip before enqueueing URLs for crawling. Default: `_pos,_sid,_ss,_fid,bvroute,bvstate`.
 - `--keep-shopify-collection-product-urls`: do not canonicalize Shopify `/collections/<collection>/products/<handle>` URLs to `/products/<handle>` for crawl deduplication.
 - `--boilerplate-threshold`: fraction of crawled pages above which repeated internal links are boilerplate. Default: `0.80`.
@@ -54,6 +54,10 @@ Optional flags:
 - `--contact-email`: contact email included in the User-Agent.
 - `--resume`: resume from `<output-dir>/.checkpoint.json` without prompting.
 - `--no-body-text`: skip body content extraction. No `page_content.csv` is produced.
+- `--no-sitemap`: do not fetch XML sitemaps to seed the frontier. By default the crawler reads `Sitemap:` directives from `robots.txt` (falling back to `/sitemap.xml`), expands sitemap index files, and seeds every listed URL — this finds orphan pages that no internal link points to.
+- `--semrush-csv`: optional CSV of SEMRush URLs (e.g. a Site Audit "Crawled Pages" export) to include in the coverage reconciliation report.
+- `--gsc-csv`: optional CSV of GSC indexed-page URLs to include in the coverage reconciliation report.
+- `--seed-urls`: path to a CSV/text file of additional URLs to seed into the frontier (repeatable). Use to force-fetch coverage-gap URLs that are neither internally linked nor in the sitemap (e.g. the `discovery_gap` rows from a prior reconciliation run).
 
 If a checkpoint exists and `--resume` is not set, the crawler prompts to resume or start fresh. On `Ctrl+C`, it saves a checkpoint and exits.
 
@@ -64,16 +68,27 @@ The output directory contains:
 - `pages.csv`: one row per crawled URL.
 - `links.csv`: one row per link instance.
 - `page_content.csv`: one row per crawled HTML URL where body extraction ran.
+- `coverage_reconciliation.csv`: one row per URL in the union of the crawl, sitemap, and any provided SEMRush/GSC lists, with `in_crawl`/`in_sitemap`/`in_semrush`/`in_gsc` flags and a `classification` (`crawled` or `discovery_gap`). Use this as the go/no-go on completeness.
 - `crawl_log.txt`: timestamped `INFO`, `WARNING`, and `ERROR` events.
-- `crawl_summary.json`: crawl totals and configuration.
+- `crawl_summary.json`: crawl totals, configuration, and a `coverage_reconciliation` block with per-source coverage counts.
 
 `pages.csv` columns, in order:
 
 ```text
 url, final_url, status_code, crawl_depth, title, h1, meta_description,
+canonical_url, meta_robots, x_robots_tag, indexable, word_count,
+redirect_count, redirect_chain,
 internal_outlinks_count, external_outlinks_count, internal_inlinks_count,
 crawl_duration_ms, crawl_timestamp, error
 ```
+
+- `canonical_url`: href from `<link rel="canonical">`, resolved to an absolute URL.
+- `meta_robots`: raw content of `<meta name="robots">`.
+- `x_robots_tag`: raw `X-Robots-Tag` response header.
+- `indexable`: `False` when `noindex` (or a standalone `none` directive) is present in either robots source, otherwise `True`.
+- `word_count`: word count of the extracted body text (`0` when body extraction is disabled or found no content).
+- `redirect_count`: number of redirect hops before the final response (`0` if the URL was served directly).
+- `redirect_chain`: the full hop sequence as `<url> (<status>) > ... > <final_url> (<status>)`, empty when there were no redirects.
 
 `links.csv` columns, in order:
 
@@ -89,7 +104,7 @@ url, main_heading_text, body_text, extraction_quality, truncated,
 original_length, char_count, extracted_at
 ```
 
-`page_content.csv.url` matches `pages.csv.url` for joining. `body_text` is cleaned main-page content capped at 3,000 characters at a word boundary.
+`page_content.csv.url` matches `pages.csv.url` for joining. `body_text` is cleaned main-page content. A safety ceiling of 50,000 characters (at a word boundary) exists but sits well above real page lengths, so normal pages are never truncated.
 
 Extraction quality values:
 
@@ -107,9 +122,14 @@ Extraction quality values:
 - Body extraction is enabled by default and can be disabled with `--no-body-text`.
 - Body extraction removes common non-content containers before selecting content, including `script`, `style`, `noscript`, `template`, `nav`, `header`, `footer`, `aside`, `form`, cookie/consent widgets, chat widgets, and hidden elements.
 - Terminal output includes a live URL progress bar plus fetch/queue/status updates.
-- The crawler waits for `networkidle` up to `--networkidle-timeout`, applies `--wait-buffer`, and keeps a hard page cap of 30 seconds.
+- The render gate is `domcontentloaded` (from navigation) plus `--wait-buffer`, with a hard page cap of 30 seconds. `networkidle` is only awaited when `--networkidle-timeout` is greater than `0`; it is disabled by default because modern stacks (Shopify analytics/chat/pixels) hold connections open and never reach network idle, which otherwise forces every page to the 30-second cap.
+- Scheme-less and bare-domain hrefs are normalized before resolution: protocol-relative `//host/path` adopts the page scheme, and bare hosts such as `www.example.com/x` or `example.com/x` are treated as absolute external URLs rather than being joined onto the page path.
+- When `--include-subdomains` is not set, only the exact start host (and its `www.` variant) is treated as internal; sibling subdomains such as `answers.example.com` are external and are not queued.
+- `links.csv` `source_url` and `target_url` are canonicalized with the same function used for the crawl frontier, so internal link targets reconcile against `pages.csv` (no phantom "uncrawled" collection-scoped product aliases).
 - Crawl discovery strips known non-content query parameters before enqueueing URLs. This prevents Shopify search/recommendation params such as `_pos`, `_sid`, `_ss`, `_fid` and Bazaarvoice review params such as `bvroute`, `bvstate` from creating thousands of duplicate product-page fetches. Link instances are still recorded in `links.csv`.
 - Shopify collection-context product URLs are canonicalized for crawling, so `/collections/all/products/example` and `/products/example` are fetched as the same page by default. Use `--keep-shopify-collection-product-urls` to disable this.
+- XML sitemaps are ingested at startup and seeded into the frontier (disable with `--no-sitemap`). A link crawler only finds what is linked from pages it parses, so sitemap seeding is what surfaces orphaned-but-indexed pages. Sitemap index files are expanded recursively and gzipped sitemaps are supported.
+- A coverage reconciliation report is always written. The crawled URL set is diffed against the sitemap (and any `--semrush-csv` / `--gsc-csv` lists), normalized with the same canonicalization used for the crawl frontier so the diff is not full of false mismatches. `in-source-but-not-crawled` is the discovery gap; `crawled-but-not-in-sitemap` is orphans/cruft/non-canonical.
 - `robots.txt` is honored by default using the crawler User-Agent.
 - Obvious non-page assets such as images, PDFs, scripts, stylesheets, and fonts are recorded as links but are not enqueued for page crawling.
 - Other non-HTML resources that are crawled are recorded as page errors and are not parsed.

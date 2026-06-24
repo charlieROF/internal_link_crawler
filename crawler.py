@@ -24,18 +24,23 @@ from output import (
     CrawlLogger,
     delete_checkpoint,
     load_checkpoint,
+    read_url_list_csv,
     write_checkpoint,
     write_links_csv,
     write_page_content_csv,
     write_pages_csv,
+    write_reconciliation_csv,
     write_summary,
 )
+from sitemap import discover_sitemap_urls
 from url_utils import (
     DomainPolicy,
     canonicalize_start_url,
+    hostname,
     is_internal_url,
     is_non_html_asset_url,
     normalize_url,
+    reconcile_key,
     registered_domain,
 )
 
@@ -52,7 +57,7 @@ class CrawlConfig:
     max_pages: Optional[int] = 2000
     rate_limit: float = 1.0
     wait_buffer_seconds: float = 2.0
-    networkidle_timeout_seconds: float = 5.0
+    networkidle_timeout_seconds: float = 0.0
     boilerplate_threshold: float = 0.80
     include_subdomains: bool = False
     ignore_robots: bool = False
@@ -60,6 +65,10 @@ class CrawlConfig:
     body_text_enabled: bool = True
     ignored_crawl_query_params: tuple[str, ...] = ("_pos", "_sid", "_ss", "_fid", "bvroute", "bvstate")
     canonicalize_shopify_product_urls: bool = True
+    sitemap_enabled: bool = True
+    semrush_csv: Optional[str] = None
+    gsc_csv: Optional[str] = None
+    seed_urls_files: tuple[str, ...] = ()
 
 
 @dataclass
@@ -73,9 +82,13 @@ class InternalLinkCrawler:
     def __init__(self, config: CrawlConfig):
         self.config = config
         self.start_url = canonicalize_start_url(config.start_url)
+        start_host = hostname(self.start_url)
+        if start_host.startswith("www."):
+            start_host = start_host[4:]
         self.policy = DomainPolicy(
             registered_domain=registered_domain(self.start_url),
             include_subdomains=config.include_subdomains,
+            start_host=start_host,
         )
         self.logger = CrawlLogger(config.output_dir)
         self.user_agent = self._user_agent()
@@ -92,12 +105,20 @@ class InternalLinkCrawler:
         self.crawl_started = datetime.now(timezone.utc)
         self.max_pages_reached = False
         self._last_request_at: dict[str, float] = {}
+        self.sitemap_urls: set[str] = set()  # reconcile keys of all sitemap URLs
+        self.sitemap_repr: dict[str, str] = {}  # reconcile key -> representative raw URL
+        self.sitemap_url_count = 0
+        self.sitemap_seeded_count = 0
+        self.sitemap_source = "disabled"
+        self.seeded_extra_count = 0
 
     async def run(self, resume_state: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         if resume_state:
             self._load_state(resume_state)
 
         await self._load_robots()
+        await self._seed_from_sitemap()
+        self._seed_extra_urls()
         started_monotonic = time.monotonic()
 
         try:
@@ -195,10 +216,14 @@ class InternalLinkCrawler:
                 final_url = normalize_url(page.url) or page.url
                 status = response.status if response else 0
                 duration_ms = int((time.monotonic() - started) * 1000)
+                redirect_count, redirect_chain = await self._redirect_chain(response)
                 self.logger.info(f"Fetched {url} status={status} duration_ms={duration_ms}")
 
                 if status >= 400:
-                    return self._page_row(url, final_url, status, depth, duration_ms, timestamp, error=""), []
+                    return self._page_row(
+                        url, final_url, status, depth, duration_ms, timestamp, error="",
+                        redirect_count=redirect_count, redirect_chain=redirect_chain,
+                    ), []
 
                 content_type = ""
                 if response:
@@ -212,13 +237,26 @@ class InternalLinkCrawler:
                         duration_ms,
                         timestamp,
                         error=f"Non-HTML response: {content_type}",
+                        redirect_count=redirect_count,
+                        redirect_chain=redirect_chain,
                     ), []
 
                 html = await page.content()
                 metadata = extract_page_metadata(html)
                 page_links = extract_links(html, final_url, self.policy, self.logger)
+                word_count = 0
                 if self.config.body_text_enabled:
-                    self._extract_body_content(html, url)
+                    content_record = self._extract_body_content(html, url)
+                    word_count = int(content_record.get("word_count", 0))
+
+                x_robots_tag = ""
+                if response:
+                    x_robots_tag = (await response.header_value("x-robots-tag")) or ""
+                canonical_url = ""
+                if metadata.canonical_url:
+                    canonical_url = normalize_url(metadata.canonical_url, final_url) or metadata.canonical_url
+                indexable = _is_indexable(metadata.meta_robots, x_robots_tag)
+
                 internal_count = sum(1 for link in page_links if link.is_internal)
                 external_count = len(page_links) - internal_count
                 row = self._page_row(
@@ -231,6 +269,13 @@ class InternalLinkCrawler:
                     title=metadata.title,
                     h1=metadata.h1,
                     meta_description=metadata.meta_description,
+                    canonical_url=canonical_url,
+                    meta_robots=metadata.meta_robots,
+                    x_robots_tag=_collapse_inline_ws(x_robots_tag),
+                    indexable=indexable,
+                    word_count=word_count,
+                    redirect_count=redirect_count,
+                    redirect_chain=redirect_chain,
                     internal_outlinks_count=internal_count,
                     external_outlinks_count=external_count,
                 )
@@ -254,18 +299,50 @@ class InternalLinkCrawler:
 
         return self._page_row(url, url, 0, depth, 0, datetime.now(timezone.utc).isoformat(), error="Unknown error"), []
 
-    async def _wait_for_render(self, page, url: str, started: float) -> None:
-        remaining_ms = max(0, PAGE_TIMEOUT_MS - int((time.monotonic() - started) * 1000))
-        networkidle_timeout_ms = int(self.config.networkidle_timeout_seconds * 1000)
-        networkidle_wait_ms = min(networkidle_timeout_ms, remaining_ms)
-        if networkidle_wait_ms > 0:
+    async def _redirect_chain(self, response) -> tuple[int, str]:
+        """Walk the navigation's redirect history. Returns (hop_count, chain), where
+        chain is "<url> (<status>) > ... > <final_url> (<status>)". hop_count is the
+        number of redirects before the final response (0 when there were none)."""
+        if response is None:
+            return 0, ""
+        requests = []
+        request = response.request
+        while request is not None:
+            requests.append(request)
+            request = request.redirected_from
+        requests.reverse()  # earliest hop first
+
+        hops: list[str] = []
+        for req in requests:
             try:
-                await page.wait_for_load_state("networkidle", timeout=networkidle_wait_ms)
-            except PlaywrightTimeoutError:
-                self.logger.warning(
-                    f"Network idle timeout after {self.config.networkidle_timeout_seconds}s on "
-                    f"{url}; using currently rendered HTML."
-                )
+                resp = await req.response()
+                status = resp.status if resp else 0
+            except Exception:
+                status = 0
+            hops.append(f"{req.url} ({status})")
+        redirect_count = max(0, len(hops) - 1)
+        if redirect_count == 0:
+            return 0, ""
+        return redirect_count, " > ".join(hops)
+
+    async def _wait_for_render(self, page, url: str, started: float) -> None:
+        # Primary gate is domcontentloaded (already awaited by page.goto) plus the
+        # fixed buffer below. networkidle is NOT a reliable gate on modern stacks:
+        # Shopify holds analytics/chat/pixel connections open indefinitely, so it
+        # never fires and every page burns the full page timeout. It is therefore
+        # opt-in (networkidle_timeout_seconds > 0) and never the primary gate.
+        if self.config.networkidle_timeout_seconds > 0:
+            remaining_ms = max(0, PAGE_TIMEOUT_MS - int((time.monotonic() - started) * 1000))
+            networkidle_timeout_ms = int(self.config.networkidle_timeout_seconds * 1000)
+            networkidle_wait_ms = min(networkidle_timeout_ms, remaining_ms)
+            if networkidle_wait_ms > 0:
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=networkidle_wait_ms)
+                except PlaywrightTimeoutError:
+                    self.logger.warning(
+                        f"Network idle timeout after {self.config.networkidle_timeout_seconds}s on "
+                        f"{url}; using currently rendered HTML."
+                    )
 
         remaining_ms = max(0, PAGE_TIMEOUT_MS - int((time.monotonic() - started) * 1000))
         requested_buffer_ms = int(self.config.wait_buffer_seconds * 1000)
@@ -276,6 +353,16 @@ class InternalLinkCrawler:
             await page.wait_for_timeout(buffer_ms)
 
     def _finalize(self, started_monotonic: float) -> dict[str, Any]:
+        # Canonicalize the link graph with the same function used for the crawl
+        # frontier so source_url/target_url reconcile against pages.csv. Without
+        # this, collection-scoped product aliases (/collections/x/products/y)
+        # appear as phantom "never crawled" internal targets even though their
+        # canonical /products/y was crawled.
+        for link in self.links:
+            link.source_url = self._canonical_crawl_url(link.source_url)
+            if link.is_internal:
+                link.target_url = self._canonical_crawl_url(link.target_url)
+
         inlink_counts: dict[str, int] = {}
         for link in self.links:
             if link.is_internal:
@@ -319,12 +406,95 @@ class InternalLinkCrawler:
                 "include_subdomains": self.config.include_subdomains,
                 "ignore_robots": self.config.ignore_robots,
                 "boilerplate_threshold": self.config.boilerplate_threshold,
+                "sitemap_enabled": self.config.sitemap_enabled,
             },
             "body_extraction": self._body_extraction_summary(),
+            "coverage_reconciliation": self._build_reconciliation(),
         }
         write_summary(self.config.output_dir, summary)
         self._print_summary(summary)
         return summary
+
+    def _build_reconciliation(self) -> dict[str, Any]:
+        """Reconcile the crawled URL set against the sitemap and any provided
+        SEMRush / GSC URL lists. Writes coverage_reconciliation.csv and returns a
+        top-line summary block for crawl_summary.json. All sources are normalized
+        with the shared reconcile_key so diffs aren't full of false mismatches."""
+        pre = self._canonical_crawl_url
+        crawl_repr: dict[str, str] = {}
+        for page in self.pages:
+            key = reconcile_key(page["url"], pre)
+            if not key:
+                continue
+            if key not in crawl_repr or page.get("status_code") == 200:
+                crawl_repr[key] = page["url"]
+        crawled = set(crawl_repr)
+
+        sources: dict[str, set[str]] = {}
+        repr_maps: dict[str, dict[str, str]] = {"crawl": crawl_repr}
+        if self.config.sitemap_enabled:
+            sources["sitemap"] = set(self.sitemap_urls)
+            repr_maps["sitemap"] = self.sitemap_repr
+        if self.config.semrush_csv:
+            sources["semrush"], repr_maps["semrush"] = self._load_external_keys(self.config.semrush_csv, "semrush")
+        if self.config.gsc_csv:
+            sources["gsc"], repr_maps["gsc"] = self._load_external_keys(self.config.gsc_csv, "gsc")
+
+        # write the per-URL artifact (union of every source)
+        all_keys = set(crawled)
+        for keys in sources.values():
+            all_keys |= keys
+
+        def representative(key: str) -> str:
+            for name in ("crawl", "sitemap", "semrush", "gsc"):
+                if key in repr_maps.get(name, {}):
+                    return repr_maps[name][key]
+            return f"https://{key}"
+
+        rows = []
+        for key in sorted(all_keys):
+            in_crawl = key in crawled
+            row = {
+                "url": representative(key),
+                "in_crawl": in_crawl,
+                "in_sitemap": key in sources.get("sitemap", set()),
+                "in_semrush": key in sources.get("semrush", set()),
+                "in_gsc": key in sources.get("gsc", set()),
+                "classification": "crawled" if in_crawl else "discovery_gap",
+            }
+            rows.append(row)
+        write_reconciliation_csv(self.config.output_dir, rows)
+
+        summary: dict[str, Any] = {"crawled_urls": len(crawled)}
+        for name, keys in sources.items():
+            covered = len(keys & crawled)
+            block = {
+                "total": len(keys),
+                "covered_by_crawl": covered,
+                "not_crawled": len(keys - crawled),
+                "coverage_pct": round(100 * covered / len(keys), 2) if keys else 0.0,
+            }
+            if name == "sitemap":
+                block["source"] = self.sitemap_source
+                block["crawled_not_in_sitemap"] = len(crawled - keys)
+            summary[name] = block
+        return summary
+
+    def _load_external_keys(self, path: str, label: str) -> tuple[set[str], dict[str, str]]:
+        keys: set[str] = set()
+        repr_map: dict[str, str] = {}
+        try:
+            raw_urls = read_url_list_csv(path)
+        except Exception as exc:
+            self.logger.warning(f"Could not read {label} CSV {path}: {exc}")
+            return keys, repr_map
+        for raw in raw_urls:
+            key = reconcile_key(raw, self._canonical_crawl_url)
+            if key:
+                keys.add(key)
+                repr_map.setdefault(key, raw)
+        self.logger.info(f"Loaded {len(keys)} {label} URLs for reconciliation from {path}.")
+        return keys, repr_map
 
     async def _load_robots(self) -> None:
         if self.config.ignore_robots:
@@ -341,6 +511,86 @@ class InternalLinkCrawler:
         except Exception as exc:
             self.logger.warning(f"Could not fetch robots.txt from {robots_url}: {exc}")
             self.robot_parser = None
+
+    async def _seed_from_sitemap(self) -> None:
+        if not self.config.sitemap_enabled:
+            self.logger.info("Sitemap seeding disabled (--no-sitemap).")
+            return
+
+        result = await asyncio.to_thread(
+            discover_sitemap_urls, self.start_url, self.user_agent, self.logger
+        )
+        self.sitemap_source = result.source
+        seeded = 0
+        out_of_scope = 0
+        for raw in result.urls:
+            key = reconcile_key(raw, self._canonical_crawl_url)
+            if key:
+                self.sitemap_urls.add(key)
+                self.sitemap_repr.setdefault(key, raw)
+            normalized = normalize_url(raw)
+            if not normalized:
+                continue
+            crawl_url = self._canonical_crawl_url(normalized)
+            if not is_internal_url(crawl_url, self.policy):
+                out_of_scope += 1
+                continue
+            if is_non_html_asset_url(crawl_url):
+                continue
+            crawl_key = self._crawl_key(crawl_url)
+            if crawl_key in self.visited_crawl_keys or crawl_key in self.queued_crawl_keys:
+                continue
+            self.queue.append((crawl_url, 0))
+            self.queued.add(crawl_url)
+            self.queued_crawl_keys.add(crawl_key)
+            seeded += 1
+
+        self.sitemap_url_count = len(self.sitemap_urls)
+        self.sitemap_seeded_count = seeded
+        self.logger.info(
+            f"Sitemap seeded {seeded} new URLs into the frontier "
+            f"({self.sitemap_url_count} sitemap URLs total, {out_of_scope} out-of-scope skipped)."
+        )
+        tqdm.write(
+            f"Sitemap ({self.sitemap_source}): {self.sitemap_url_count} URLs, "
+            f"{seeded} added to crawl frontier."
+        )
+
+    def _seed_extra_urls(self) -> None:
+        """Seed additional URLs from user-supplied files into the frontier. Use to
+        force-fetch coverage-gap URLs (e.g. SEMRush/GSC pages) that are neither
+        internally linked nor in the sitemap."""
+        if not self.config.seed_urls_files:
+            return
+        total = 0
+        for path in self.config.seed_urls_files:
+            try:
+                raw_urls = read_url_list_csv(path)
+            except Exception as exc:
+                self.logger.warning(f"Could not read seed URL file {path}: {exc}")
+                continue
+            added = 0
+            for raw in raw_urls:
+                normalized = normalize_url(raw)
+                if not normalized:
+                    continue
+                crawl_url = self._canonical_crawl_url(normalized)
+                if not is_internal_url(crawl_url, self.policy):
+                    continue
+                if is_non_html_asset_url(crawl_url):
+                    continue
+                crawl_key = self._crawl_key(crawl_url)
+                if crawl_key in self.visited_crawl_keys or crawl_key in self.queued_crawl_keys:
+                    continue
+                self.queue.append((crawl_url, 0))
+                self.queued.add(crawl_url)
+                self.queued_crawl_keys.add(crawl_key)
+                added += 1
+                total += 1
+            self.logger.info(f"Seeded {added} new URLs from {path}.")
+        self.seeded_extra_count = total
+        if total:
+            tqdm.write(f"Seed files: {total} extra URLs added to crawl frontier.")
 
     def _robots_allowed(self, url: str) -> bool:
         if self.config.ignore_robots or not self.robot_parser:
@@ -411,7 +661,7 @@ class InternalLinkCrawler:
             message = f"{message} | error={page_result['error']}"
         tqdm.write(message)
 
-    def _extract_body_content(self, html: str, url: str) -> None:
+    def _extract_body_content(self, html: str, url: str) -> dict[str, Any]:
         extracted_at = datetime.now(timezone.utc).isoformat()
         try:
             result = extract_content(html, url)
@@ -423,6 +673,7 @@ class InternalLinkCrawler:
                 "truncated": result["truncated"],
                 "original_length": result["original_length"],
                 "char_count": result["char_count"],
+                "word_count": result["word_count"],
                 "extracted_at": extracted_at,
             }
             self.page_content_records.append(record)
@@ -435,20 +686,22 @@ class InternalLinkCrawler:
                 self.logger.warning(
                     f"Body extraction fallback for {url}: no main/article/selector match, used largest text block"
                 )
+            return record
         except Exception as exc:
             self.logger.error(f"Body extraction failed for {url}: {exc}")
-            self.page_content_records.append(
-                {
-                    "url": url,
-                    "main_heading_text": "",
-                    "body_text": "",
-                    "extraction_quality": "error",
-                    "truncated": False,
-                    "original_length": 0,
-                    "char_count": 0,
-                    "extracted_at": extracted_at,
-                }
-            )
+            record = {
+                "url": url,
+                "main_heading_text": "",
+                "body_text": "",
+                "extraction_quality": "error",
+                "truncated": False,
+                "original_length": 0,
+                "char_count": 0,
+                "word_count": 0,
+                "extracted_at": extracted_at,
+            }
+            self.page_content_records.append(record)
+            return record
 
     def _body_extraction_summary(self) -> dict[str, Any]:
         if not self.config.body_text_enabled:
@@ -554,6 +807,13 @@ class InternalLinkCrawler:
         title: str = "",
         h1: str = "",
         meta_description: str = "",
+        canonical_url: str = "",
+        meta_robots: str = "",
+        x_robots_tag: str = "",
+        indexable: Any = "",
+        word_count: int = 0,
+        redirect_count: int = 0,
+        redirect_chain: str = "",
         internal_outlinks_count: int = 0,
         external_outlinks_count: int = 0,
         error: str = "",
@@ -566,6 +826,13 @@ class InternalLinkCrawler:
             "title": title,
             "h1": h1,
             "meta_description": meta_description,
+            "canonical_url": canonical_url,
+            "meta_robots": meta_robots,
+            "x_robots_tag": x_robots_tag,
+            "indexable": indexable,
+            "word_count": word_count,
+            "redirect_count": redirect_count,
+            "redirect_chain": redirect_chain,
             "internal_outlinks_count": internal_outlinks_count,
             "external_outlinks_count": external_outlinks_count,
             "internal_inlinks_count": 0,
@@ -583,6 +850,20 @@ class InternalLinkCrawler:
         print(f"Internal links: {summary['internal_links_found']}")
         print(f"External links: {summary['external_links_found']}")
         print(f"Max pages reached: {summary['max_pages_reached']}")
+        recon = summary.get("coverage_reconciliation", {})
+        sm = recon.get("sitemap")
+        if sm:
+            print(
+                f"Sitemap coverage: {sm['covered_by_crawl']}/{sm['total']} "
+                f"({sm['coverage_pct']}%); {sm['not_crawled']} in sitemap not crawled"
+            )
+        for name in ("semrush", "gsc"):
+            block = recon.get(name)
+            if block:
+                print(
+                    f"{name.upper()} coverage: {block['covered_by_crawl']}/{block['total']} "
+                    f"({block['coverage_pct']}%); {block['not_crawled']} not crawled"
+                )
 
 
 def load_existing_checkpoint(output_dir: Path) -> dict[str, Any]:
@@ -592,3 +873,23 @@ def load_existing_checkpoint(output_dir: Path) -> dict[str, Any]:
 def _robots_url(start_url: str) -> str:
     parts = urlsplit(start_url)
     return urlunsplit((parts.scheme, parts.netloc, "/robots.txt", "", ""))
+
+
+def _is_indexable(meta_robots: str, x_robots_tag: str) -> bool:
+    """A page is non-indexable if ``noindex`` appears, or the standalone ``none``
+    directive is present, in either the robots meta tag or the X-Robots-Tag header.
+
+    ``none`` is only matched as a bare directive so valued directives such as
+    ``max-image-preview:none`` are not mistaken for it.
+    """
+    combined = f"{meta_robots},{x_robots_tag}".lower()
+    if re.search(r"\bnoindex\b", combined):
+        return False
+    for part in re.split(r"[,;]", combined):
+        if ":" not in part and part.strip() == "none":
+            return False
+    return True
+
+
+def _collapse_inline_ws(value: str) -> str:
+    return " ".join((value or "").split())

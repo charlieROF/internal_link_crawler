@@ -13,6 +13,8 @@ class PageMetadata:
     title: str
     h1: str
     meta_description: str
+    canonical_url: str = ""
+    meta_robots: str = ""
 
 
 @dataclass
@@ -33,7 +35,32 @@ def extract_page_metadata(html: str) -> PageMetadata:
     h1 = _collapse_ws(h1_tag.get_text(" ")) if h1_tag else ""
     meta = soup.find("meta", attrs={"name": lambda value: value and value.lower() == "description"})
     meta_description = _collapse_ws(meta.get("content", "")) if meta else ""
-    return PageMetadata(title=title, h1=h1, meta_description=meta_description)
+
+    canonical_tag = soup.find("link", attrs={"rel": _rel_matches("canonical")})
+    canonical_url = _collapse_ws(canonical_tag.get("href", "")) if canonical_tag else ""
+
+    robots_meta = soup.find("meta", attrs={"name": lambda value: value and value.lower() == "robots"})
+    meta_robots = _collapse_ws(robots_meta.get("content", "")) if robots_meta else ""
+
+    return PageMetadata(
+        title=title,
+        h1=h1,
+        meta_description=meta_description,
+        canonical_url=canonical_url,
+        meta_robots=meta_robots,
+    )
+
+
+def _rel_matches(target: str):
+    target = target.lower()
+
+    def matcher(value) -> bool:
+        if not value:
+            return False
+        tokens = value if isinstance(value, list) else str(value).split()
+        return any(token.lower() == target for token in tokens)
+
+    return matcher
 
 
 def extract_links(html: str, source_url: str, policy: DomainPolicy, logger=None) -> list[ExtractedLink]:
