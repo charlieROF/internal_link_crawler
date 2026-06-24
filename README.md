@@ -77,6 +77,7 @@ The output directory contains:
 ```text
 url, final_url, status_code, crawl_depth, title, h1, meta_description,
 canonical_url, meta_robots, x_robots_tag, indexable, word_count,
+redirect_count, redirect_chain,
 internal_outlinks_count, external_outlinks_count, internal_inlinks_count,
 crawl_duration_ms, crawl_timestamp, error
 ```
@@ -86,6 +87,8 @@ crawl_duration_ms, crawl_timestamp, error
 - `x_robots_tag`: raw `X-Robots-Tag` response header.
 - `indexable`: `False` when `noindex` (or a standalone `none` directive) is present in either robots source, otherwise `True`.
 - `word_count`: word count of the extracted body text (`0` when body extraction is disabled or found no content).
+- `redirect_count`: number of redirect hops before the final response (`0` if the URL was served directly).
+- `redirect_chain`: the full hop sequence as `<url> (<status>) > ... > <final_url> (<status>)`, empty when there were no redirects.
 
 `links.csv` columns, in order:
 

@@ -21,6 +21,8 @@ PAGES_COLUMNS = [
     "x_robots_tag",
     "indexable",
     "word_count",
+    "redirect_count",
+    "redirect_chain",
     "internal_outlinks_count",
     "external_outlinks_count",
     "internal_inlinks_count",

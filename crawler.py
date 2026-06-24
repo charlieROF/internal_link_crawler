@@ -216,10 +216,14 @@ class InternalLinkCrawler:
                 final_url = normalize_url(page.url) or page.url
                 status = response.status if response else 0
                 duration_ms = int((time.monotonic() - started) * 1000)
+                redirect_count, redirect_chain = await self._redirect_chain(response)
                 self.logger.info(f"Fetched {url} status={status} duration_ms={duration_ms}")
 
                 if status >= 400:
-                    return self._page_row(url, final_url, status, depth, duration_ms, timestamp, error=""), []
+                    return self._page_row(
+                        url, final_url, status, depth, duration_ms, timestamp, error="",
+                        redirect_count=redirect_count, redirect_chain=redirect_chain,
+                    ), []
 
                 content_type = ""
                 if response:
@@ -233,6 +237,8 @@ class InternalLinkCrawler:
                         duration_ms,
                         timestamp,
                         error=f"Non-HTML response: {content_type}",
+                        redirect_count=redirect_count,
+                        redirect_chain=redirect_chain,
                     ), []
 
                 html = await page.content()
@@ -268,6 +274,8 @@ class InternalLinkCrawler:
                     x_robots_tag=_collapse_inline_ws(x_robots_tag),
                     indexable=indexable,
                     word_count=word_count,
+                    redirect_count=redirect_count,
+                    redirect_chain=redirect_chain,
                     internal_outlinks_count=internal_count,
                     external_outlinks_count=external_count,
                 )
@@ -290,6 +298,32 @@ class InternalLinkCrawler:
                 await page.close()
 
         return self._page_row(url, url, 0, depth, 0, datetime.now(timezone.utc).isoformat(), error="Unknown error"), []
+
+    async def _redirect_chain(self, response) -> tuple[int, str]:
+        """Walk the navigation's redirect history. Returns (hop_count, chain), where
+        chain is "<url> (<status>) > ... > <final_url> (<status>)". hop_count is the
+        number of redirects before the final response (0 when there were none)."""
+        if response is None:
+            return 0, ""
+        requests = []
+        request = response.request
+        while request is not None:
+            requests.append(request)
+            request = request.redirected_from
+        requests.reverse()  # earliest hop first
+
+        hops: list[str] = []
+        for req in requests:
+            try:
+                resp = await req.response()
+                status = resp.status if resp else 0
+            except Exception:
+                status = 0
+            hops.append(f"{req.url} ({status})")
+        redirect_count = max(0, len(hops) - 1)
+        if redirect_count == 0:
+            return 0, ""
+        return redirect_count, " > ".join(hops)
 
     async def _wait_for_render(self, page, url: str, started: float) -> None:
         # Primary gate is domcontentloaded (already awaited by page.goto) plus the
@@ -778,6 +812,8 @@ class InternalLinkCrawler:
         x_robots_tag: str = "",
         indexable: Any = "",
         word_count: int = 0,
+        redirect_count: int = 0,
+        redirect_chain: str = "",
         internal_outlinks_count: int = 0,
         external_outlinks_count: int = 0,
         error: str = "",
@@ -795,6 +831,8 @@ class InternalLinkCrawler:
             "x_robots_tag": x_robots_tag,
             "indexable": indexable,
             "word_count": word_count,
+            "redirect_count": redirect_count,
+            "redirect_chain": redirect_chain,
             "internal_outlinks_count": internal_outlinks_count,
             "external_outlinks_count": external_outlinks_count,
             "internal_inlinks_count": 0,
