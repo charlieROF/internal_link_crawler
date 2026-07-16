@@ -101,6 +101,18 @@ _EXTRACT_JS = r"""
     .map(a => ({ text: clean(a.innerText), href: a.getAttribute('href') || '' }))
     .filter(l => l.text && l.href);
 
+  // Blocks that emit their own text (p/li/blockquote/table) are not descended
+  // into, so any images they contain would be lost. Alt text is real copy, so
+  // surface them alongside the block.
+  const emitImagesIn = el => {
+    el.querySelectorAll('img').forEach(im => {
+      if (!hidden(im) && rendered(im)) {
+        push({ type: 'image', alt: clean(im.getAttribute('alt')),
+               href: im.getAttribute('src') || '', text: '' }, im);
+      }
+    });
+  };
+
   const walk = el => {
     for (const node of el.childNodes) {
       if (node.nodeType === 3) {                       // raw text in a container
@@ -119,15 +131,20 @@ _EXTRACT_JS = r"""
       } else if (tag === 'P') {
         const t = clean(node.innerText);
         if (t && rendered(node)) push({ type: 'paragraph', text: t, links: linksIn(node) }, node);
+        emitImagesIn(node);
       } else if (tag === 'UL' || tag === 'OL') {
         const items = [...node.children]
           .filter(li => li.tagName === 'LI' && !hidden(li))
           .map(li => clean(li.innerText)).filter(Boolean);
-        if (items.length) push({ type: 'list', ordered: tag === 'OL', items: items }, node);
+        if (items.length) push({ type: 'list', ordered: tag === 'OL', items: items,
+                                 links: linksIn(node) }, node);
+        emitImagesIn(node);
       } else if (tag === 'BLOCKQUOTE') {
         const t = clean(node.innerText); if (t) push({ type: 'blockquote', text: t }, node);
+        emitImagesIn(node);
       } else if (tag === 'TABLE') {
         const t = clean(node.innerText); if (t) push({ type: 'table', text: t }, node);
+        emitImagesIn(node);
       } else if (tag === 'LABEL') {
         const t = clean(node.innerText); if (t && rendered(node)) push({ type: 'form_label', text: t }, node);
       } else if (tag === 'INPUT' || tag === 'TEXTAREA') {
@@ -156,12 +173,7 @@ _EXTRACT_JS = r"""
           // Image links (gallery/card items) wrap an <img> in a leaf anchor. Emit
           // the image too — its alt is real copy. Targeted rather than a full walk
           // so the anchor's own text isn't duplicated as a text block.
-          node.querySelectorAll('img').forEach(im => {
-            if (!hidden(im) && rendered(im)) {
-              push({ type: 'image', alt: clean(im.getAttribute('alt')),
-                     href: im.getAttribute('src') || '', text: '' }, im);
-            }
-          });
+          emitImagesIn(node);
         }
       } else if (tag === 'BUTTON') {
         const t = clean(node.innerText); if (t && rendered(node)) push({ type: 'button', text: t }, node);
