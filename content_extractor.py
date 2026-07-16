@@ -71,9 +71,9 @@ def extract(rendered_html: str, url: str) -> dict[str, Any]:
     return _result(truncated_text, heading, quality, truncated, original_length)
 
 
-def _remove_non_content_elements(soup: BeautifulSoup) -> None:
+def _remove_non_content_elements(soup: BeautifulSoup, selectors: list[str] | None = None) -> None:
     elements_to_remove = []
-    for selector in REMOVAL_SELECTORS:
+    for selector in (REMOVAL_SELECTORS if selectors is None else selectors):
         elements_to_remove.extend(_safe_select(soup, selector))
 
     for element in soup.find_all(style=True):
