@@ -101,21 +101,6 @@ _EXTRACT_JS = r"""
     .map(a => ({ text: clean(a.innerText), href: a.getAttribute('href') || '' }))
     .filter(l => l.text && l.href);
 
-  const walkForm = form => {
-    form.querySelectorAll('label').forEach(l => {
-      const t = clean(l.innerText); if (t && !hidden(l)) push({ type: 'form_label', text: t }, l);
-    });
-    form.querySelectorAll('input,textarea').forEach(f => {
-      const p = clean(f.getAttribute('placeholder')); if (p) push({ type: 'form_placeholder', text: p }, f);
-    });
-    form.querySelectorAll('button').forEach(b => {
-      const t = clean(b.innerText); if (t && !hidden(b)) push({ type: 'form_button', text: t }, b);
-    });
-    form.querySelectorAll('input[type=submit],input[type=button]').forEach(b => {
-      const v = clean(b.value); if (v) push({ type: 'form_button', text: v }, b);
-    });
-  };
-
   const walk = el => {
     for (const node of el.childNodes) {
       if (node.nodeType === 3) {                       // raw text in a container
@@ -143,8 +128,16 @@ _EXTRACT_JS = r"""
         const t = clean(node.innerText); if (t) push({ type: 'blockquote', text: t }, node);
       } else if (tag === 'TABLE') {
         const t = clean(node.innerText); if (t) push({ type: 'table', text: t }, node);
-      } else if (tag === 'FORM') {
-        walkForm(node);
+      } else if (tag === 'LABEL') {
+        const t = clean(node.innerText); if (t && rendered(node)) push({ type: 'form_label', text: t }, node);
+      } else if (tag === 'INPUT' || tag === 'TEXTAREA') {
+        const ty = (node.getAttribute('type') || '').toLowerCase();
+        if (ty === 'submit' || ty === 'button') {
+          const v = clean(node.value); if (v) push({ type: 'form_button', text: v }, node);
+        } else {
+          const ph = clean(node.getAttribute('placeholder'));
+          if (ph) push({ type: 'form_placeholder', text: ph }, node);
+        }
       } else if (tag === 'IMG') {
         if (rendered(node)) push({ type: 'image', alt: clean(node.getAttribute('alt')),
                                   href: node.getAttribute('src') || '', text: '' }, node);
@@ -160,6 +153,15 @@ _EXTRACT_JS = r"""
           const t = clean(node.innerText);
           if (t) push({ type: isCta(node) ? 'cta' : 'link', text: t,
                         href: node.getAttribute('href') || '' }, node);
+          // Image links (gallery/card items) wrap an <img> in a leaf anchor. Emit
+          // the image too — its alt is real copy. Targeted rather than a full walk
+          // so the anchor's own text isn't duplicated as a text block.
+          node.querySelectorAll('img').forEach(im => {
+            if (!hidden(im) && rendered(im)) {
+              push({ type: 'image', alt: clean(im.getAttribute('alt')),
+                     href: im.getAttribute('src') || '', text: '' }, im);
+            }
+          });
         }
       } else if (tag === 'BUTTON') {
         const t = clean(node.innerText); if (t && rendered(node)) push({ type: 'button', text: t }, node);
