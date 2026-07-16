@@ -43,9 +43,14 @@ LINKS_COLUMNS = [
 
 PAGE_BLOCKS_COLUMNS = [
     "url",
+    "section",
+    "row",
     "order",
     "type",
     "level",
+    "font_size",
+    "font_weight",
+    "y",
     "text",
     "href",
     "alt",
@@ -141,17 +146,25 @@ def write_page_blocks_csv(output_dir: Path, records: list[dict[str, Any]]) -> No
             order = 0
             for block in record.get("blocks", []):
                 block_type = block.get("type", "")
+                common = {
+                    "url": url,
+                    "section": block.get("section", ""),
+                    "row": block.get("row", ""),
+                    "font_size": block.get("font_size", ""),
+                    "font_weight": block.get("font_weight", ""),
+                    "y": block.get("y", ""),
+                }
                 if block_type == "list":
                     for item in block.get("items", []):
                         order += 1
                         writer.writerow({
-                            "url": url, "order": order, "type": "list_item",
+                            **common, "order": order, "type": "list_item",
                             "level": "", "text": item, "href": "", "alt": "",
                         })
                     continue
                 order += 1
                 writer.writerow({
-                    "url": url,
+                    **common,
                     "order": order,
                     "type": block_type,
                     "level": block.get("level", ""),

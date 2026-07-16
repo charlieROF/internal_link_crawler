@@ -2,205 +2,248 @@ from __future__ import annotations
 
 """Structured content-block extraction for content-inventory / rewrite work.
 
-Unlike content_extractor (which flattens a page to one prose string for SEO
-grounding), this walks the main content in document order and emits typed blocks
-with their link targets intact, so a page can be reconstructed into content
-frameworks (headline / intro / feature grid / social proof / CTA).
+Runs IN the rendered page rather than over the HTML string. That matters:
 
-Deliberately structural, not semantic: it reports what the markup IS (heading,
-paragraph, list, blockquote, cta), never what a block MEANS ("Feature Grid").
-Semantic labelling is the consuming prompt's job — hardcoding it here would be
-brittle across templates.
+* Hidden slider/carousel clones are skipped, so the inventory never contains
+  copy that isn't on the live page.
+* Computed font-size/weight give the real visual hierarchy. Markup lies — on
+  armclark.com the subheadline renders 62px/900 while its H1 is 30px/700, and
+  H5 is used for body copy. Anything trusting tag names gets it backwards.
+* Geometry gives true reading order and reveals grid rows (siblings sharing a y).
+
+Deliberately structural, not semantic: it reports what a block IS and how it
+renders, never what it MEANS ("Feature Grid"). Semantic mapping is the consuming
+prompt's job — hardcoding it would be brittle across templates.
 """
 
 from typing import Any, Optional
 
-from bs4 import BeautifulSoup, NavigableString
-
-from content_extractor import (
-    REMOVAL_SELECTORS,
-    _collapse_ws,
-    _remove_non_content_elements,
-)
 from url_utils import normalize_url
 
 
-# Same noise removal as the prose extractor, but KEEP <form>: form labels and
-# button copy are real page content when the goal is rewriting the site.
-BLOCK_REMOVAL_SELECTORS = [s for s in REMOVAL_SELECTORS if s != "form"]
+ROW_TOLERANCE_PX = 24  # blocks whose tops sit within this share a visual row
 
-HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
-BLOCKISH = HEADINGS | {"p", "ul", "ol", "blockquote", "table", "form"}
-# class/id tokens that mark a link as a styled call-to-action rather than prose
-CTA_HINTS = ("btn", "button", "cta")
-MIN_TEXT = 1
+# Walks the live DOM and returns raw blocks + render signals. Kept in one
+# evaluate() call (~100ms/page, no extra page loads).
+_EXTRACT_JS = r"""
+() => {
+  const CTA_HINTS = ['btn', 'button', 'cta'];
+  const HEADINGS = new Set(['H1','H2','H3','H4','H5','H6']);
+  const BLOCKISH = ['H1','H2','H3','H4','H5','H6','P','UL','OL','BLOCKQUOTE','TABLE','FORM'];
+  const BLOCKISH_SET = new Set(BLOCKISH);
+  const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','NAV','HEADER','FOOTER',
+                        'ASIDE','SVG','IFRAME','CANVAS','SELECT','OPTION']);
+  const NON_TEXT_LEAF = new Set(['IMG','FIGURE','A','BUTTON','BR','INPUT','TEXTAREA','LABEL','VIDEO']);
+
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const hidden = el => {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return true;
+    if (parseFloat(cs.opacity) < 0.05) return true;
+    return false;
+  };
+  const rendered = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+
+  const root = document.querySelector('main')
+            || document.querySelector('article')
+            || document.querySelector('[role=main]')
+            || document.body;
+  const quality = document.querySelector('main') ? 'main'
+                : document.querySelector('article') ? 'article'
+                : document.querySelector('[role=main]') ? 'main' : 'body';
+  if (!root) return { quality: 'uncertain', blocks: [] };
+
+  // Section = nearest <section>/section-ish ancestor, else the top-level child
+  // of the root that contains the block. Stable and template-truthful.
+  const sectionIds = new Map();
+  const sectionOf = el => {
+    let found = null;
+    try { found = el.closest('section,[class*="section" i],[class*="hero" i]'); } catch (e) { found = null; }
+    if (!found || !root.contains(found) || found === root) {
+      let cur = el;
+      while (cur && cur.parentElement && cur.parentElement !== root) cur = cur.parentElement;
+      found = cur;
+    }
+    if (!found) return 0;
+    if (!sectionIds.has(found)) sectionIds.set(found, sectionIds.size + 1);
+    return sectionIds.get(found);
+  };
+
+  const out = [];
+  const push = (o, el) => {
+    if (el) {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      o.x = Math.round(r.left + window.scrollX);
+      o.y = Math.round(r.top + window.scrollY);
+      o.w = Math.round(r.width);
+      o.h = Math.round(r.height);
+      o.font_size = Math.round(parseFloat(cs.fontSize) || 0);
+      o.font_weight = cs.fontWeight;
+      o.section = sectionOf(el);
+    }
+    out.push(o);
+  };
+
+  const isCta = a => {
+    if ((a.getAttribute('role') || '').toLowerCase() === 'button') return true;
+    const tok = ((a.className || '') + ' ' + (a.id || '')).toString().toLowerCase();
+    return CTA_HINTS.some(h => tok.includes(h));
+  };
+  const hasBlockChild = el => !!el.querySelector(BLOCKISH.join(','));
+  const isTextLeaf = el => {
+    if (BLOCKISH_SET.has(el.tagName) || NON_TEXT_LEAF.has(el.tagName)) return false;
+    if (hasBlockChild(el)) return false;
+    if (el.querySelector('a,button,img')) return false;
+    return !!clean(el.innerText);
+  };
+  const linksIn = el => [...el.querySelectorAll('a')]
+    .map(a => ({ text: clean(a.innerText), href: a.getAttribute('href') || '' }))
+    .filter(l => l.text && l.href);
+
+  const walkForm = form => {
+    form.querySelectorAll('label').forEach(l => {
+      const t = clean(l.innerText); if (t && !hidden(l)) push({ type: 'form_label', text: t }, l);
+    });
+    form.querySelectorAll('input,textarea').forEach(f => {
+      const p = clean(f.getAttribute('placeholder')); if (p) push({ type: 'form_placeholder', text: p }, f);
+    });
+    form.querySelectorAll('button').forEach(b => {
+      const t = clean(b.innerText); if (t && !hidden(b)) push({ type: 'form_button', text: t }, b);
+    });
+    form.querySelectorAll('input[type=submit],input[type=button]').forEach(b => {
+      const v = clean(b.value); if (v) push({ type: 'form_button', text: v }, b);
+    });
+  };
+
+  const walk = el => {
+    for (const node of el.childNodes) {
+      if (node.nodeType === 3) {                       // raw text in a container
+        const t = clean(node.textContent);
+        if (t) push({ type: 'text', text: t }, el);
+        continue;
+      }
+      if (node.nodeType !== 1) continue;
+      const tag = node.tagName;
+      if (SKIP.has(tag)) continue;
+      if (hidden(node)) continue;                      // skips hidden subtrees (slider clones)
+
+      if (HEADINGS.has(tag)) {
+        const t = clean(node.innerText);
+        if (t && rendered(node)) push({ type: 'heading', level: +tag[1], text: t }, node);
+      } else if (tag === 'P') {
+        const t = clean(node.innerText);
+        if (t && rendered(node)) push({ type: 'paragraph', text: t, links: linksIn(node) }, node);
+      } else if (tag === 'UL' || tag === 'OL') {
+        const items = [...node.children]
+          .filter(li => li.tagName === 'LI' && !hidden(li))
+          .map(li => clean(li.innerText)).filter(Boolean);
+        if (items.length) push({ type: 'list', ordered: tag === 'OL', items: items }, node);
+      } else if (tag === 'BLOCKQUOTE') {
+        const t = clean(node.innerText); if (t) push({ type: 'blockquote', text: t }, node);
+      } else if (tag === 'TABLE') {
+        const t = clean(node.innerText); if (t) push({ type: 'table', text: t }, node);
+      } else if (tag === 'FORM') {
+        walkForm(node);
+      } else if (tag === 'IMG') {
+        if (rendered(node)) push({ type: 'image', alt: clean(node.getAttribute('alt')),
+                                  href: node.getAttribute('src') || '', text: '' }, node);
+      } else if (tag === 'FIGURE') {
+        const img = node.querySelector('img');
+        const cap = node.querySelector('figcaption');
+        if (img) push({ type: 'image', alt: clean(img.getAttribute('alt')),
+                        href: img.getAttribute('src') || '', text: cap ? clean(cap.innerText) : '' }, node);
+        else walk(node);
+      } else if (tag === 'A') {
+        if (hasBlockChild(node)) walk(node);
+        else {
+          const t = clean(node.innerText);
+          if (t) push({ type: isCta(node) ? 'cta' : 'link', text: t,
+                        href: node.getAttribute('href') || '' }, node);
+        }
+      } else if (tag === 'BUTTON') {
+        const t = clean(node.innerText); if (t && rendered(node)) push({ type: 'button', text: t }, node);
+      } else if (isTextLeaf(node)) {
+        const t = clean(node.innerText); if (t && rendered(node)) push({ type: 'text', text: t }, node);
+      } else {
+        walk(node);
+      }
+    }
+  };
+
+  walk(root);
+  return { quality: quality, blocks: out };
+}
+"""
 
 
-def extract_blocks(rendered_html: str, url: str, base_url: Optional[str] = None) -> dict[str, Any]:
-    soup = BeautifulSoup(rendered_html or "", "html.parser")
-    _remove_non_content_elements(soup, BLOCK_REMOVAL_SELECTORS)
+async def extract_blocks(page, url: str, base_url: Optional[str] = None) -> dict[str, Any]:
+    """Extract rendered content blocks from an open Playwright page."""
+    result = await page.evaluate(_EXTRACT_JS)
+    blocks = result.get("blocks", []) or []
+    base = base_url or url
 
-    content, quality = _select_block_root(soup)
-    if content is None:
-        return {"url": url, "extraction_quality": "uncertain", "blocks": []}
+    for block in blocks:
+        if block.get("href"):
+            block["href"] = _resolve(block["href"], base)
+        for link in block.get("links", []) or []:
+            link["href"] = _resolve(link.get("href", ""), base)
+        block["font_weight"] = _weight(block.get("font_weight"))
 
-    blocks: list[dict[str, Any]] = []
-    _walk(content, blocks, base_url or url)
+    blocks = _assign_rows(blocks)
     for index, block in enumerate(blocks, 1):
         block["order"] = index
-    return {"url": url, "extraction_quality": quality, "blocks": blocks}
+
+    return {
+        "url": url,
+        "extraction_quality": result.get("quality", "uncertain"),
+        "blocks": blocks,
+        "sections": _group_sections(blocks),
+    }
 
 
-def _select_block_root(soup: BeautifulSoup):
-    """Pick the root to walk for a content inventory.
+def _assign_rows(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tag blocks that share a visual row within their section. Repeated siblings
+    on one row are what a feature/card grid actually is, so this makes grids
+    detectable without guessing at class names."""
+    by_section: dict[int, list[dict[str, Any]]] = {}
+    for block in blocks:
+        by_section.setdefault(block.get("section", 0), []).append(block)
 
-    Prefer a real main/article landmark. Otherwise fall back to the whole <body>
-    (chrome already stripped) — NOT the largest text block. A content inventory
-    must capture every block on the page; "biggest container wins" is a prose
-    heuristic that silently drops hero copy, testimonials, and CTAs.
-    """
-    main = soup.find("main")
-    if main is not None:
-        return main, "main"
-    article = soup.find("article")
-    if article is not None:
-        return article, "article"
-    role_main = soup.find(attrs={"role": lambda v: v and v.lower() == "main"})
-    if role_main is not None:
-        return role_main, "main"
-    if soup.body is not None:
-        return soup.body, "body"
-    return (soup, "body") if soup else (None, "uncertain")
+    for section_blocks in by_section.values():
+        rows: list[int] = []  # representative y per row
+        for block in section_blocks:
+            y = block.get("y", 0)
+            match = next((i for i, ry in enumerate(rows) if abs(ry - y) <= ROW_TOLERANCE_PX), None)
+            if match is None:
+                rows.append(y)
+                match = len(rows) - 1
+            block["row"] = match + 1
+    return blocks
 
 
-def _walk(element, blocks: list[dict[str, Any]], base_url: str) -> None:
-    for child in getattr(element, "children", []):
-        # Raw text sitting directly in a container (very common — many templates
-        # never use <p>). Without this the prose is silently dropped.
-        if isinstance(child, NavigableString):
-            text = _collapse_ws(str(child))
-            if text:
-                _emit(blocks, {"type": "text", "text": text})
-            continue
-        name = getattr(child, "name", None)
-        if name is None:
-            continue
-        if _is_text_leaf(child):
-            _emit(blocks, {"type": "text", "text": _text(child)})
-        elif name in HEADINGS:
-            _emit(blocks, {"type": "heading", "level": int(name[1]), "text": _text(child)})
-        elif name == "p":
-            _emit(blocks, {"type": "paragraph", "text": _text(child), "links": _inline_links(child, base_url)})
-        elif name in ("ul", "ol"):
-            items = [_text(li) for li in child.find_all("li", recursive=False)]
-            items = [item for item in items if item]
-            if items:
-                _emit(blocks, {"type": "list", "ordered": name == "ol", "items": items})
-        elif name == "blockquote":
-            _emit(blocks, {"type": "blockquote", "text": _text(child)})
-        elif name == "table":
-            _emit(blocks, {"type": "table", "text": _text(child)})
-        elif name == "form":
-            _walk_form(child, blocks, base_url)
-        elif name in ("img", "figure"):
-            image = child if name == "img" else child.find("img")
-            if image is not None:
-                _emit(blocks, {
-                    "type": "image",
-                    "alt": _collapse_ws(image.get("alt", "") or ""),
-                    "href": _resolve(image.get("src", ""), base_url),
-                    "text": _text(child.find("figcaption")) if name == "figure" else "",
-                })
-            else:
-                _walk(child, blocks, base_url)
-        elif name == "a":
-            # A link wrapping real block structure (a card) is a container, not a CTA.
-            if _has_block_children(child):
-                _walk(child, blocks, base_url)
-            else:
-                _emit(blocks, {
-                    "type": "cta" if _looks_like_cta(child) else "link",
-                    "text": _text(child),
-                    "href": _resolve(child.get("href", ""), base_url),
-                })
-        elif name == "button":
-            _emit(blocks, {"type": "button", "text": _text(child)})
-        else:
-            _walk(child, blocks, base_url)
+def _group_sections(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    index_by_id: dict[int, int] = {}
+    for block in blocks:
+        section_id = block.get("section", 0)
+        if section_id not in index_by_id:
+            index_by_id[section_id] = len(sections)
+            sections.append({"section": section_id, "y": block.get("y", 0), "blocks": []})
+        sections[index_by_id[section_id]]["blocks"].append(block)
+    return sections
 
 
-def _walk_form(form, blocks: list[dict[str, Any]], base_url: str) -> None:
-    for label in form.find_all("label"):
-        text = _text(label)
-        if text:
-            _emit(blocks, {"type": "form_label", "text": text})
-    for field in form.find_all(["input", "textarea", "select"]):
-        placeholder = _collapse_ws(field.get("placeholder", "") or "")
-        if placeholder:
-            _emit(blocks, {"type": "form_placeholder", "text": placeholder})
-    for button in form.find_all(["button"]):
-        text = _text(button)
-        if text:
-            _emit(blocks, {"type": "form_button", "text": text})
-    for submit in form.find_all("input", attrs={"type": lambda v: v and v.lower() in ("submit", "button")}):
-        value = _collapse_ws(submit.get("value", "") or "")
-        if value:
-            _emit(blocks, {"type": "form_button", "text": value})
-
-
-def _emit(blocks: list[dict[str, Any]], block: dict[str, Any]) -> None:
-    has_text = len(block.get("text", "") or "") >= MIN_TEXT
-    if block["type"] == "list" and block.get("items"):
-        blocks.append(block)
-        return
-    if block["type"] == "image" and (block.get("alt") or block.get("href")):
-        blocks.append(block)
-        return
-    if has_text:
-        blocks.append(block)
-
-
-def _has_block_children(element) -> bool:
-    return element.find(list(BLOCKISH)) is not None
-
-
-def _is_text_leaf(element) -> bool:
-    """A container (div/span/etc.) whose whole job is holding a run of prose.
-
-    Many templates put body copy in bare <div>s. Treating those as one text block
-    keeps the copy intact instead of fragmenting or losing it. Containers holding
-    structure or interactive children are walked instead, so their blocks/links
-    are emitted properly.
-    """
-    if element.name in HEADINGS or element.name in BLOCKISH:
-        return False
-    if element.name in ("img", "figure", "a", "button", "br"):
-        return False
-    if _has_block_children(element):
-        return False
-    if element.find(["a", "button", "img"]) is not None:
-        return False
-    return bool(_text(element))
-
-
-def _looks_like_cta(anchor) -> bool:
-    """Only markup-declared calls to action. Previously any standalone link
-    counted, which mislabelled gallery/carousel controls ('10' -> '#') as CTAs.
-    Un-marked standalone links are still captured, just typed as 'link'."""
-    if (anchor.get("role") or "").lower() == "button":
-        return True
-    tokens = " ".join((anchor.get("class") or []) + [anchor.get("id") or ""]).lower()
-    return any(hint in tokens for hint in CTA_HINTS)
-
-
-def _inline_links(element, base_url: str) -> list[dict[str, str]]:
-    links = []
-    for anchor in element.find_all("a"):
-        text = _text(anchor)
-        href = _resolve(anchor.get("href", ""), base_url)
-        if text and href:
-            links.append({"text": text, "href": href})
-    return links
+def _weight(value: Any) -> int:
+    text = str(value or "").strip().lower()
+    if text == "normal":
+        return 400
+    if text == "bold":
+        return 700
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _resolve(href: str, base_url: str) -> str:
@@ -208,9 +251,3 @@ def _resolve(href: str, base_url: str) -> str:
     if not href:
         return ""
     return normalize_url(href, base_url) or href
-
-
-def _text(element) -> str:
-    if element is None:
-        return ""
-    return _collapse_ws(element.get_text(" ", strip=True))

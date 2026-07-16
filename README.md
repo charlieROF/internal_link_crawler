@@ -69,7 +69,14 @@ The output directory contains:
 - `pages.csv`: one row per crawled URL.
 - `links.csv`: one row per link instance.
 - `page_content.csv`: one row per crawled HTML URL where body extraction ran.
-- `page_blocks.csv` / `page_blocks.json` (with `--content-blocks`): the page's content blocks in document order. CSV is one row per block (`url, order, type, level, text, href, alt`; lists expand to `list_item` rows) for spreadsheet review; JSON keeps lists grouped and includes inline links per text block. Block `type` is structural only (`heading`, `text`, `paragraph`, `list`, `blockquote`, `cta`, `link`, `button`, `image`, `form_label`, `form_placeholder`, `form_button`) — mapping blocks onto semantic slots like "Feature Grid" or "Social proof" is left to the consuming prompt, since those vary by template.
+- `page_blocks.csv` / `page_blocks.json` (with `--content-blocks`): the page's content blocks in rendered reading order. CSV is one row per block (`url, section, row, order, type, level, font_size, font_weight, y, text, href, alt`; lists expand to `list_item` rows) for spreadsheet review; JSON additionally groups blocks into `sections` and keeps lists and per-text inline links intact.
+
+  Extraction runs inside the rendered page, which matters for a content inventory:
+  - **Hidden content is excluded.** Slider/carousel clones and CSS-hidden blocks never reach the inventory, so you don't rewrite copy that isn't on the live page. (Parsing HTML alone catches only inline `style="display:none"`, not class-based hiding.)
+  - **`font_size`/`font_weight` give the real hierarchy.** Tag names are often wrong — a page may render its H1 at 30px/700 while the H2 beneath it is 62px/900, or use H5 for body copy. Trust the rendered values over `level`.
+  - **`section` and `row` give shape.** `section` is the nearest section-ish ancestor; `row` groups blocks sharing a visual row, which is what makes card/feature grids detectable without guessing class names.
+
+  Block `type` is structural only (`heading`, `text`, `paragraph`, `list`, `blockquote`, `cta`, `link`, `button`, `image`, `form_label`, `form_placeholder`, `form_button`). Mapping blocks onto semantic slots like "Feature Grid" or "Social proof" is left to the consuming prompt, since those vary by template.
 - `coverage_reconciliation.csv`: one row per URL in the union of the crawl, sitemap, and any provided SEMRush/GSC lists, with `in_crawl`/`in_sitemap`/`in_semrush`/`in_gsc` flags and a `classification` (`crawled` or `discovery_gap`). Use this as the go/no-go on completeness.
 - `crawl_log.txt`: timestamped `INFO`, `WARNING`, and `ERROR` events.
 - `crawl_summary.json`: crawl totals, configuration, and a `coverage_reconciliation` block with per-source coverage counts.

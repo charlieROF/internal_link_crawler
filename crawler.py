@@ -255,7 +255,7 @@ class InternalLinkCrawler:
                     content_record = self._extract_body_content(html, url)
                     word_count = int(content_record.get("word_count", 0))
                 if self.config.content_blocks_enabled:
-                    self._extract_content_blocks(html, url, final_url)
+                    await self._extract_content_blocks(page, url, final_url)
 
                 x_robots_tag = ""
                 if response:
@@ -714,18 +714,18 @@ class InternalLinkCrawler:
             self.page_content_records.append(record)
             return record
 
-    def _extract_content_blocks(self, html: str, url: str, final_url: str) -> None:
+    async def _extract_content_blocks(self, page, url: str, final_url: str) -> None:
         try:
-            record = extract_blocks(html, url, final_url)
+            record = await extract_blocks(page, url, final_url)
             self.page_block_records.append(record)
             self.logger.info(
-                f"Blocks extracted from {url}: {len(record['blocks'])} blocks, "
-                f"quality={record['extraction_quality']}"
+                f"Blocks extracted from {url}: {len(record['blocks'])} blocks in "
+                f"{len(record['sections'])} sections, quality={record['extraction_quality']}"
             )
         except Exception as exc:
             self.logger.error(f"Block extraction failed for {url}: {exc}")
             self.page_block_records.append(
-                {"url": url, "extraction_quality": "error", "blocks": []}
+                {"url": url, "extraction_quality": "error", "blocks": [], "sections": []}
             )
 
     def _body_extraction_summary(self) -> dict[str, Any]:
