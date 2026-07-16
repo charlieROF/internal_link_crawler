@@ -54,6 +54,7 @@ Optional flags:
 - `--contact-email`: contact email included in the User-Agent.
 - `--resume`: resume from `<output-dir>/.checkpoint.json` without prompting.
 - `--no-body-text`: skip body content extraction. No `page_content.csv` is produced.
+- `--content-blocks`: also extract structured content blocks in document order (headings with level, paragraphs/text, lists, blockquotes, CTAs and links with resolved hrefs, images with alt, form labels/placeholders/buttons). Writes `page_blocks.csv` and `page_blocks.json`. Use for content inventory and rewrite work when you have no CMS access. `page_content.csv` is unaffected.
 - `--no-sitemap`: do not fetch XML sitemaps to seed the frontier. By default the crawler reads `Sitemap:` directives from `robots.txt` (falling back to `/sitemap.xml`), expands sitemap index files, and seeds every listed URL — this finds orphan pages that no internal link points to.
 - `--semrush-csv`: optional CSV of SEMRush URLs (e.g. a Site Audit "Crawled Pages" export) to include in the coverage reconciliation report.
 - `--gsc-csv`: optional CSV of GSC indexed-page URLs to include in the coverage reconciliation report.
@@ -68,6 +69,7 @@ The output directory contains:
 - `pages.csv`: one row per crawled URL.
 - `links.csv`: one row per link instance.
 - `page_content.csv`: one row per crawled HTML URL where body extraction ran.
+- `page_blocks.csv` / `page_blocks.json` (with `--content-blocks`): the page's content blocks in document order. CSV is one row per block (`url, order, type, level, text, href, alt`; lists expand to `list_item` rows) for spreadsheet review; JSON keeps lists grouped and includes inline links per text block. Block `type` is structural only (`heading`, `text`, `paragraph`, `list`, `blockquote`, `cta`, `link`, `button`, `image`, `form_label`, `form_placeholder`, `form_button`) — mapping blocks onto semantic slots like "Feature Grid" or "Social proof" is left to the consuming prompt, since those vary by template.
 - `coverage_reconciliation.csv`: one row per URL in the union of the crawl, sitemap, and any provided SEMRush/GSC lists, with `in_crawl`/`in_sitemap`/`in_semrush`/`in_gsc` flags and a `classification` (`crawled` or `discovery_gap`). Use this as the go/no-go on completeness.
 - `crawl_log.txt`: timestamped `INFO`, `WARNING`, and `ERROR` events.
 - `crawl_summary.json`: crawl totals, configuration, and a `coverage_reconciliation` block with per-source coverage counts.

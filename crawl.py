@@ -73,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip body content extraction. No page_content.csv is produced.",
     )
     parser.add_argument(
+        "--content-blocks",
+        action="store_true",
+        help=(
+            "Also extract structured content blocks (headings, paragraphs, lists, "
+            "blockquotes, CTAs with hrefs, images, form copy) in document order. "
+            "Writes page_blocks.csv and page_blocks.json. Use for content inventory "
+            "and rewrite work; page_content.csv is unaffected."
+        ),
+    )
+    parser.add_argument(
         "--ignore-crawl-query-params",
         default="_pos,_sid,_ss,_fid,bvroute,bvstate",
         help=(
@@ -161,6 +171,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         ignore_robots=args.ignore_robots,
         contact_email=args.contact_email,
         body_text_enabled=not args.no_body_text,
+        content_blocks_enabled=args.content_blocks,
         ignored_crawl_query_params=_parse_csv_arg(args.ignore_crawl_query_params),
         canonicalize_shopify_product_urls=not args.keep_shopify_collection_product_urls,
         sitemap_enabled=not args.no_sitemap,

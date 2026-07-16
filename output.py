@@ -41,6 +41,16 @@ LINKS_COLUMNS = [
     "rel_attribute",
 ]
 
+PAGE_BLOCKS_COLUMNS = [
+    "url",
+    "order",
+    "type",
+    "level",
+    "text",
+    "href",
+    "alt",
+]
+
 RECONCILIATION_COLUMNS = [
     "url",
     "in_crawl",
@@ -113,6 +123,42 @@ def write_page_content_csv(records: list[dict[str, Any]], output_dir: Path) -> N
         writer.writeheader()
         for record in records:
             writer.writerow({column: _csv_value(record.get(column)) for column in PAGE_CONTENT_COLUMNS})
+
+
+def write_page_blocks_json(output_dir: Path, records: list[dict[str, Any]]) -> None:
+    with (output_dir / "page_blocks.json").open("w", encoding="utf-8") as handle:
+        json.dump(records, handle, indent=2, ensure_ascii=False)
+
+
+def write_page_blocks_csv(output_dir: Path, records: list[dict[str, Any]]) -> None:
+    """Flatten the block tree to one row per block. Lists expand to one
+    list_item row per item so the CSV stays reviewable in a spreadsheet."""
+    with (output_dir / "page_blocks.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PAGE_BLOCKS_COLUMNS)
+        writer.writeheader()
+        for record in records:
+            url = record.get("url", "")
+            order = 0
+            for block in record.get("blocks", []):
+                block_type = block.get("type", "")
+                if block_type == "list":
+                    for item in block.get("items", []):
+                        order += 1
+                        writer.writerow({
+                            "url": url, "order": order, "type": "list_item",
+                            "level": "", "text": item, "href": "", "alt": "",
+                        })
+                    continue
+                order += 1
+                writer.writerow({
+                    "url": url,
+                    "order": order,
+                    "type": block_type,
+                    "level": block.get("level", ""),
+                    "text": block.get("text", ""),
+                    "href": block.get("href", ""),
+                    "alt": block.get("alt", ""),
+                })
 
 
 def write_reconciliation_csv(output_dir: Path, rows: list[dict[str, Any]]) -> None:

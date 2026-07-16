@@ -17,6 +17,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from tqdm import tqdm
 
+from block_extractor import extract_blocks
 from boilerplate import apply_boilerplate_detection
 from content_extractor import extract as extract_content
 from link_extractor import ExtractedLink, extract_links, extract_page_metadata
@@ -27,6 +28,8 @@ from output import (
     read_url_list_csv,
     write_checkpoint,
     write_links_csv,
+    write_page_blocks_csv,
+    write_page_blocks_json,
     write_page_content_csv,
     write_pages_csv,
     write_reconciliation_csv,
@@ -63,6 +66,7 @@ class CrawlConfig:
     ignore_robots: bool = False
     contact_email: Optional[str] = None
     body_text_enabled: bool = True
+    content_blocks_enabled: bool = False
     ignored_crawl_query_params: tuple[str, ...] = ("_pos", "_sid", "_ss", "_fid", "bvroute", "bvstate")
     canonicalize_shopify_product_urls: bool = True
     sitemap_enabled: bool = True
@@ -101,6 +105,7 @@ class InternalLinkCrawler:
         self.pages: list[dict[str, Any]] = []
         self.links: list[ExtractedLink] = []
         self.page_content_records: list[dict[str, Any]] = []
+        self.page_block_records: list[dict[str, Any]] = []
         self.pages_skipped_robots = 0
         self.crawl_started = datetime.now(timezone.utc)
         self.max_pages_reached = False
@@ -198,6 +203,7 @@ class InternalLinkCrawler:
                 "pages": self.pages,
                 "links": self.links,
                 "page_content_records": self.page_content_records if self.config.body_text_enabled else [],
+                "page_block_records": self.page_block_records if self.config.content_blocks_enabled else [],
                 "pages_skipped_robots": self.pages_skipped_robots,
                 "crawl_started": self.crawl_started.isoformat(),
                 "max_pages_reached": self.max_pages_reached,
@@ -248,6 +254,8 @@ class InternalLinkCrawler:
                 if self.config.body_text_enabled:
                     content_record = self._extract_body_content(html, url)
                     word_count = int(content_record.get("word_count", 0))
+                if self.config.content_blocks_enabled:
+                    self._extract_content_blocks(html, url, final_url)
 
                 x_robots_tag = ""
                 if response:
@@ -381,6 +389,9 @@ class InternalLinkCrawler:
         write_links_csv(self.config.output_dir, self.links)
         if self.config.body_text_enabled and self.page_content_records:
             write_page_content_csv(self.page_content_records, self.config.output_dir)
+        if self.config.content_blocks_enabled and self.page_block_records:
+            write_page_blocks_csv(self.config.output_dir, self.page_block_records)
+            write_page_blocks_json(self.config.output_dir, self.page_block_records)
 
         completed = datetime.now(timezone.utc)
         summary = {
@@ -703,6 +714,20 @@ class InternalLinkCrawler:
             self.page_content_records.append(record)
             return record
 
+    def _extract_content_blocks(self, html: str, url: str, final_url: str) -> None:
+        try:
+            record = extract_blocks(html, url, final_url)
+            self.page_block_records.append(record)
+            self.logger.info(
+                f"Blocks extracted from {url}: {len(record['blocks'])} blocks, "
+                f"quality={record['extraction_quality']}"
+            )
+        except Exception as exc:
+            self.logger.error(f"Block extraction failed for {url}: {exc}")
+            self.page_block_records.append(
+                {"url": url, "extraction_quality": "error", "blocks": []}
+            )
+
     def _body_extraction_summary(self) -> dict[str, Any]:
         if not self.config.body_text_enabled:
             return {
@@ -763,6 +788,7 @@ class InternalLinkCrawler:
             )
         self.links = [ExtractedLink(**item) for item in state.get("links", [])]
         self.page_content_records = list(state.get("page_content_records", []))
+        self.page_block_records = list(state.get("page_block_records", []))
         self.pages_skipped_robots = int(state.get("pages_skipped_robots", 0))
         if state.get("crawl_started"):
             self.crawl_started = datetime.fromisoformat(state["crawl_started"])
